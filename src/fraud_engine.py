@@ -12,10 +12,12 @@ from typing import Tuple
 from config import (
     RRID_COL, STORE_COL, DATE_COL, NPS_COL,
     L1_WINDOW_DAYS, L1_HEAVY_DUP_THRESHOLD, L1_LIGHT_DUP_THRESHOLD,
-    L2_DUP_RATIO_THRESHOLD, L2_HEAVY_DUP_COUNT_MIN,
+    L2_WINDOW_DAYS, L2_DUP_RATIO_THRESHOLD, L2_HEAVY_DUP_COUNT_MIN,
     L2_ALL_PERFECT_RATE, L2_ALL_PERFECT_MIN_RESPONSES,
     L3_MIN_RESPONSES, L3_UNIQUE_RRID_RATIO_MAX, L3_PERFECT_RATE_MIN,
-    L4_REPEAT_THRESHOLD, L4_EXCLUDED_PHRASES,
+    L4_RRID_EXACT_THRESHOLD, L4_RRID_SIMILAR_THRESHOLD,
+    L4_STORE_EXACT_THRESHOLD, L4_STORE_SIMILAR_THRESHOLD,
+    L4_EXCLUDED_PHRASES,
     L5_MONOTONE_LOW_MAX, L5_EXTREME_CONTRADICTION_AVG, L5_EXTREME_NPS_MIN,
     L5_REVERSE_AVG_MIN, L5_REVERSE_NPS_MAX,
     LAYER_WEIGHTS, IS_FRAUD_THRESHOLD, COACHING_NAME_MIN_COUNT,
@@ -106,57 +108,121 @@ def compute_store_contamination(
     df: pd.DataFrame, layer1_flags: pd.Series
 ) -> pd.DataFrame:
     """
-    Classify each store as contaminated or clean.
+    Classify each (store, 7-day window) pair as contaminated or clean.
+    Vectorized version — uses groupby + rolling-style aggregation per store-week.
 
-    A store is contaminated if ANY condition is met (PRD §3.2):
-      1. Duplicate RRID ratio > 30%
-      2. Heavy duplicate count ≥ 5
-      3. All-perfect rate > 90%  AND  ≥15 total responses
+    Groups by (store, week) where week = date floored to 7-day periods.
+    Within each group computes:
+      1. dup_ratio    — % of responses from RRIDs appearing 2+ times
+      2. heavy_dups   — count of responses from RRIDs appearing 3+ times
+      3. perfect_rate — % of responses that are all-perfect
 
-    Returns: DataFrame indexed by STORE_COL with health metrics.
+    Returns:
+      DataFrame with one row per contaminated (store, window_start) pair.
     """
-    tmp = df[[STORE_COL, RRID_COL, "is_all_perfect"]].copy()
-    tmp["_l1"] = layer1_flags.values
+    tmp = df[[STORE_COL, RRID_COL, DATE_COL, "is_all_perfect"]].copy()
+    tmp = tmp.dropna(subset=[DATE_COL])
 
-    store_stats = tmp.groupby(STORE_COL).agg(
-        total_responses    = (RRID_COL,        "count"),
-        unique_rrids       = (RRID_COL,        "nunique"),
-        all_perfect_count  = ("is_all_perfect", "sum"),
-        heavy_dup_count    = ("_l1",            lambda x: (x == "RRID_HEAVY_DUP").sum()),
-        dup_responses      = ("_l1",            lambda x: x.isin(["RRID_HEAVY_DUP", "RRID_LIGHT_DUP"]).sum()),
-    ).reset_index()
+    if len(tmp) == 0:
+        return pd.DataFrame()
 
-    store_stats["dup_ratio"]    = store_stats["dup_responses"] / store_stats["total_responses"].clip(lower=1)
-    store_stats["perfect_rate"] = store_stats["all_perfect_count"] / store_stats["total_responses"].clip(lower=1)
+    # Assign each response to a 7-day window bucket based on its date
+    min_date = tmp[DATE_COL].min()
+    tmp["_week"] = ((tmp[DATE_COL] - min_date).dt.days // L2_WINDOW_DAYS).astype(int)
 
-    crit1 = store_stats["dup_ratio"]     > L2_DUP_RATIO_THRESHOLD
-    crit2 = store_stats["heavy_dup_count"] >= L2_HEAVY_DUP_COUNT_MIN
-    crit3 = (store_stats["perfect_rate"] > L2_ALL_PERFECT_RATE) & \
-            (store_stats["total_responses"] >= L2_ALL_PERFECT_MIN_RESPONSES)
+    contaminated_windows = []
 
-    store_stats["contamination_reason"] = ""
-    store_stats.loc[crit1, "contamination_reason"] += "HIGH_DUP_RATIO|"
-    store_stats.loc[crit2, "contamination_reason"] += "HEAVY_DUP_COUNT|"
-    store_stats.loc[crit3, "contamination_reason"] += "HIGH_PERFECT_RATE|"
-    store_stats["contamination_reason"] = store_stats["contamination_reason"].str.rstrip("|")
-    store_stats["is_contaminated"]      = crit1 | crit2 | crit3
+    for (store, week), grp in tmp.groupby([STORE_COL, "_week"]):
+        total = len(grp)
+        if total == 0:
+            continue
 
-    return store_stats
+        window_start = grp[DATE_COL].min()
+        window_end = window_start + pd.Timedelta(days=L2_WINDOW_DAYS)
+
+        # Metric 1: Duplicate RRID ratio within window
+        rrid_counts = grp[RRID_COL].value_counts()
+        dup_rrids = set(rrid_counts[rrid_counts >= 2].index)
+        dup_responses = grp[RRID_COL].isin(dup_rrids).sum() if dup_rrids else 0
+        dup_ratio = dup_responses / total
+
+        # Metric 2: Heavy duplicate count
+        heavy_rrids = set(rrid_counts[rrid_counts >= L1_HEAVY_DUP_THRESHOLD].index)
+        heavy_dup_count = grp[RRID_COL].isin(heavy_rrids).sum() if heavy_rrids else 0
+
+        # Metric 3: All-perfect rate
+        perfect_count = grp["is_all_perfect"].sum()
+        perfect_rate = perfect_count / total
+
+        # Check contamination thresholds
+        crit1 = dup_ratio > L2_DUP_RATIO_THRESHOLD
+        crit2 = heavy_dup_count >= L2_HEAVY_DUP_COUNT_MIN
+        crit3 = (perfect_rate > L2_ALL_PERFECT_RATE) and (total >= L2_ALL_PERFECT_MIN_RESPONSES)
+
+        if crit1 or crit2 or crit3:
+            reason_parts = []
+            if crit1: reason_parts.append(f"HIGH_DUP_RATIO({dup_ratio:.0%})")
+            if crit2: reason_parts.append(f"HEAVY_DUP_COUNT({heavy_dup_count})")
+            if crit3: reason_parts.append(f"HIGH_PERFECT_RATE({perfect_rate:.0%})")
+
+            contaminated_windows.append({
+                STORE_COL:              store,
+                "window_start":         window_start,
+                "window_end":           window_end,
+                "contamination_reason": "|".join(reason_parts),
+                "total_responses":      total,
+                "dup_ratio":            round(dup_ratio, 3),
+                "heavy_dup_count":      int(heavy_dup_count),
+                "perfect_rate":         round(perfect_rate, 3),
+                "is_contaminated":      True,
+            })
+
+    if len(contaminated_windows) == 0:
+        print("  → No contaminated windows found")
+        return pd.DataFrame(columns=[
+            STORE_COL, "window_start", "window_end",
+            "contamination_reason", "total_responses",
+            "dup_ratio", "heavy_dup_count", "perfect_rate", "is_contaminated"
+        ])
+
+    result = pd.DataFrame(contaminated_windows)
+    print(f"  → {len(result)} contaminated (store, window) pairs found "
+          f"across {result[STORE_COL].nunique()} stores")
+    return result
 
 
 def run_layer2_store_contamination(
     df: pd.DataFrame, store_contamination: pd.DataFrame
 ) -> pd.Series:
     """
-    Flag all-perfect responses from contaminated stores.
-    Non-perfect responses at contaminated stores are NOT flagged.
+    Flag all-perfect responses that fall within a contaminated
+    (store, 7-day window) pair. Vectorized using merge.
     """
-    contaminated = set(
-        store_contamination.loc[store_contamination["is_contaminated"], STORE_COL]
-    )
     flags = pd.Series("", index=df.index, dtype=str)
-    mask  = df[STORE_COL].isin(contaminated) & df["is_all_perfect"]
-    flags[mask] = "CONTAMINATED_STORE_PERFECT"
+
+    if store_contamination is None or len(store_contamination) == 0:
+        return flags
+
+    # Build a lookup of contaminated stores with their windows
+    contam = store_contamination[[STORE_COL, "window_start", "window_end"]].copy()
+
+    # Only consider all-perfect responses
+    perfect_mask = df["is_all_perfect"] == True
+    candidates = df.loc[perfect_mask, [STORE_COL, DATE_COL]].copy()
+    candidates["_idx"] = candidates.index
+
+    # Cross-join candidates with contaminated windows on store
+    merged = candidates.merge(contam, on=STORE_COL, how="inner")
+
+    # Filter to responses within the contaminated window
+    in_window = merged[
+        (merged[DATE_COL] >= merged["window_start"]) &
+        (merged[DATE_COL] < merged["window_end"])
+    ]
+
+    flagged_indices = in_window["_idx"].unique()
+    flags.iloc[flags.index.isin(flagged_indices)] = "CONTAMINATED_STORE_PERFECT"
+
     return flags
 
 
@@ -205,26 +271,142 @@ def run_layer3_velocity_anomaly(df: pd.DataFrame) -> pd.Series:
 
 def run_layer4_text_fingerprint(df: pd.DataFrame) -> pd.Series:
     """
-    Flag copy-paste feedback: same non-trivial text ≥3 times within a store.
-    First occurrence is kept clean; subsequent copies are flagged.
+    Flag copy-paste feedback using 4 scenarios:
+      1. RRID_EXACT_COPY    — Same RRID, exact same text ≥2 times
+      2. RRID_SIMILAR_COPY  — Same RRID, similar fingerprint ≥2 times
+      3. STORE_EXACT_COPY   — Same store, exact same text ≥3 times
+      4. STORE_SIMILAR_COPY — Same store, similar fingerprint ≥4 times
+
+    Priority order (highest confidence wins):
+    RRID_EXACT > RRID_SIMILAR > STORE_EXACT > STORE_SIMILAR
+    First occurrence is always kept clean.
     """
+    import re as _re
+
     flags = pd.Series("", index=df.index, dtype=str)
 
-    # Non-trivial = more than 3 chars AND not in the excluded phrases list
-    non_trivial = (
-        df["feedback_clean"].str.len() > 3
-    ) & (~df["feedback_clean"].isin(L4_EXCLUDED_PHRASES))
-
-    sub = df.loc[non_trivial, [STORE_COL, "feedback_clean"]].copy()
-    if len(sub) == 0:
+    # Guard: check column exists
+    if "feedback_clean" not in df.columns:
+        print("  ⚠️  L4: 'feedback_clean' column not found — skipping")
         return flags
 
-    grp_key = [STORE_COL, "feedback_clean"]
-    sub["_count"] = sub.groupby(grp_key)["feedback_clean"].transform("count")
-    sub["_rank"]  = sub.groupby(grp_key).cumcount()  # 0-based, so first = 0
+    # ── Step 1: Filter to non-trivial feedback only ──────────────────────────
+    cleaned = df["feedback_clean"].fillna("").str.strip()
+    non_trivial = (
+        cleaned.str.len() > 3
+    ) & (~cleaned.isin(L4_EXCLUDED_PHRASES))
 
-    flag_mask = (sub["_count"] >= L4_REPEAT_THRESHOLD) & (sub["_rank"] >= 1)
-    flags.loc[flag_mask[flag_mask].index] = "REPEATED_FEEDBACK"
+    sub = df.loc[non_trivial, [RRID_COL, STORE_COL, "feedback_clean"]].copy()
+    sub["feedback_clean"] = sub["feedback_clean"].fillna("").str.strip()
+
+    if len(sub) == 0:
+        print("  ⚠️  L4: No non-trivial feedback found after exclusion filter")
+        return flags
+
+    print(f"  L4: {len(sub):,} non-trivial responses to check")
+
+    # ── Step 2: Compute fingerprint for near-duplicate matching ──────────────
+    _FILLER = _re.compile(
+        r"\b(very|really|so|quite|most|the|a|an|is|was|by|from|of|and|"
+        r"for|with|to|in|has|have|were|are|its|my|our|your|their|this|"
+        r"that|at|on|we|i|it|he|she|they|also|too|just|mr|ms|sir|madam)\b"
+    )
+
+    def _make_fingerprint(text: str) -> str:
+        if not isinstance(text, str) or not text.strip():
+            return ""
+        t = _FILLER.sub("", text.lower().strip())
+        t = _re.sub(r"\s+", " ", t).strip()
+        words = t.split()
+        if not words:
+            # Fingerprint collapsed to nothing — use original text truncated
+            return text.lower().strip()[:30]
+        return " ".join(words[:6])
+
+    sub["fingerprint"] = sub["feedback_clean"].apply(_make_fingerprint)
+
+    # Only remove truly empty fingerprints (empty string), not short ones
+    sub = sub[sub["fingerprint"].str.len() > 0]
+
+    if len(sub) == 0:
+        print("  ⚠️  L4: All fingerprints empty after normalisation")
+        return flags
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # SCENARIO A — RRID_EXACT_COPY
+    # Same RRID submitted exact same text 2+ times (any store)
+    # ═══════════════════════════════════════════════════════════════════════
+    grp_re = [RRID_COL, "feedback_clean"]
+    sub["_re_count"] = sub.groupby(grp_re)["feedback_clean"].transform("count")
+    sub["_re_rank"]  = sub.groupby(grp_re).cumcount()
+
+    rrid_exact_mask = (
+        (sub["_re_count"] >= L4_RRID_EXACT_THRESHOLD) &
+        (sub["_re_rank"]  >= 1)
+    ).values
+
+    flags.loc[sub.index[rrid_exact_mask]] = "RRID_EXACT_COPY"
+    print(f"  L4 Scenario A (RRID exact):    {rrid_exact_mask.sum():,} flagged")
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # SCENARIO B — RRID_SIMILAR_COPY
+    # Same RRID, similar fingerprint, 2+ times
+    # ═══════════════════════════════════════════════════════════════════════
+    grp_rs = [RRID_COL, "fingerprint"]
+    sub["_rs_count"] = sub.groupby(grp_rs)["fingerprint"].transform("count")
+    sub["_rs_rank"]  = sub.groupby(grp_rs).cumcount()
+
+    already_flagged_a = (flags.loc[sub.index] != "").values
+    rrid_sim_mask = (
+        (sub["_rs_count"] >= L4_RRID_SIMILAR_THRESHOLD) &
+        (sub["_rs_rank"]  >= 1)
+    ).values & ~already_flagged_a
+
+    flags.loc[sub.index[rrid_sim_mask]] = "RRID_SIMILAR_COPY"
+    print(f"  L4 Scenario B (RRID similar):  {rrid_sim_mask.sum():,} flagged")
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # SCENARIO C — STORE_EXACT_COPY
+    # Different RRIDs, exact same text at same store, 3+ times
+    # Must come from at least 2 different RRIDs
+    # ═══════════════════════════════════════════════════════════════════════
+    grp_se = [STORE_COL, "feedback_clean"]
+    sub["_se_count"] = sub.groupby(grp_se)["feedback_clean"].transform("count")
+    sub["_se_uniq"]  = sub.groupby(grp_se)[RRID_COL].transform("nunique")
+    sub["_se_rank"]  = sub.groupby(grp_se).cumcount()
+
+    already_flagged_ab = (flags.loc[sub.index] != "").values
+    store_exact_mask = (
+        (sub["_se_count"] >= L4_STORE_EXACT_THRESHOLD) &
+        (sub["_se_uniq"]  >= 2) &
+        (sub["_se_rank"]  >= 1)
+    ).values & ~already_flagged_ab
+
+    flags.loc[sub.index[store_exact_mask]] = "STORE_EXACT_COPY"
+    print(f"  L4 Scenario C (store exact):   {store_exact_mask.sum():,} flagged")
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # SCENARIO D — STORE_SIMILAR_COPY
+    # Different RRIDs, similar fingerprint at same store, 4+ times
+    # Catches verbal coaching
+    # ═══════════════════════════════════════════════════════════════════════
+    grp_ss = [STORE_COL, "fingerprint"]
+    sub["_ss_count"] = sub.groupby(grp_ss)["fingerprint"].transform("count")
+    sub["_ss_uniq"]  = sub.groupby(grp_ss)[RRID_COL].transform("nunique")
+    sub["_ss_rank"]  = sub.groupby(grp_ss).cumcount()
+
+    already_flagged_abc = (flags.loc[sub.index] != "").values
+    store_sim_mask = (
+        (sub["_ss_count"] >= L4_STORE_SIMILAR_THRESHOLD) &
+        (sub["_ss_uniq"]  >= 2) &
+        (sub["_ss_rank"]  >= 1)
+    ).values & ~already_flagged_abc
+
+    flags.loc[sub.index[store_sim_mask]] = "STORE_SIMILAR_COPY"
+    print(f"  L4 Scenario D (store similar): {store_sim_mask.sum():,} flagged")
+
+    total_l4 = (flags != "").sum()
+    print(f"  L4 Total: {total_l4:,} flagged across all scenarios")
 
     return flags
 
@@ -420,12 +602,27 @@ def compute_fraud_scores(
         b4.astype(int) + b5.astype(int)
     )
 
+    # Vectorized L4 sub-score based on which scenario was flagged
+    l4_scores = np.where(
+        l4.values == "RRID_EXACT_COPY",   LAYER_WEIGHTS["layer4_rrid_exact"],
+        np.where(
+            l4.values == "RRID_SIMILAR_COPY", LAYER_WEIGHTS["layer4_rrid_similar"],
+            np.where(
+                l4.values == "STORE_EXACT_COPY",  LAYER_WEIGHTS["layer4_store_exact"],
+                np.where(
+                    l4.values == "STORE_SIMILAR_COPY", LAYER_WEIGHTS["layer4_store_similar"],
+                    0,
+                ),
+            ),
+        ),
+    )
+
     # Vectorized score
     result["fraud_score"] = np.minimum(
         b1.astype(int) * LAYER_WEIGHTS["layer1"] +
         b2.astype(int) * LAYER_WEIGHTS["layer2"] +
         b3.astype(int) * LAYER_WEIGHTS["layer3"] +
-        b4.astype(int) * LAYER_WEIGHTS["layer4"] +
+        l4_scores +
         b5.astype(int) * LAYER_WEIGHTS["layer5"],
         100,
     )
@@ -470,8 +667,11 @@ def run_fraud_engine(
     print("Layer 2: Store contamination…")
     store_health = compute_store_contamination(df, l1)
     l2 = run_layer2_store_contamination(df, store_health)
-    n_cont = store_health["is_contaminated"].sum()
-    print(f"  → {n_cont} contaminated stores, {(l2 != '').sum():,} responses flagged")
+    n_cont_stores   = store_health[STORE_COL].nunique() if len(store_health) > 0 else 0
+    n_cont_windows  = len(store_health)
+    print(f"  → {n_cont_stores} contaminated stores, "
+          f"{n_cont_windows} contaminated windows, "
+          f"{(l2 != '').sum():,} responses flagged")
 
     print("Layer 3: Velocity anomaly…")
     l3 = run_layer3_velocity_anomaly(df)

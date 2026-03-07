@@ -36,10 +36,13 @@ L1_HEAVY_DUP_THRESHOLD = 3    # 3+ submissions from same RRID → ALL flagged
 L1_LIGHT_DUP_THRESHOLD = 2    # Exactly 2 → only 2nd flagged
 
 # ── Layer 2: Store Contamination ─────────────────────────────────────────────
-L2_DUP_RATIO_THRESHOLD       = 0.30   # >30% of store responses from repeat RRIDs
-L2_HEAVY_DUP_COUNT_MIN       = 5      # ≥5 responses from RRIDs with 3+ submissions
-L2_ALL_PERFECT_RATE          = 0.90   # >90% all-perfect rate at store
-L2_ALL_PERFECT_MIN_RESPONSES = 15     # Minimum responses before rate check applies
+L2_WINDOW_DAYS               = 7      # Rolling window days
+L2_DUP_RATIO_THRESHOLD       = 0.30   # >30% responses from repeat RRIDs in window
+L2_HEAVY_DUP_COUNT_MIN       = 5      # ≥5 responses from RRIDs submitting 3+ times in window
+L2_ALL_PERFECT_RATE          = 0.90   # >90% all-perfect rate in window
+L2_ALL_PERFECT_MIN_RESPONSES = 15     # Minimum responses in window before rate check applies
+ALL_PERFECT_MIN_RATING       = 5      # Sub-rating >= this = counts toward all-perfect
+ALL_PERFECT_MIN_NPS          = 10     # NPS >= this = counts toward all-perfect
 
 # ── Layer 3: Response Velocity Anomaly ───────────────────────────────────────
 L3_MIN_RESPONSES         = 6     # ≥6 responses in a store-day (P95 of clean stores)
@@ -47,7 +50,10 @@ L3_UNIQUE_RRID_RATIO_MAX = 0.70  # <70% unique RRIDs (few people, many responses
 L3_PERFECT_RATE_MIN      = 0.80  # >80% all-perfect on that store-day
 
 # ── Layer 4: Feedback Text Fingerprinting ────────────────────────────────────
-L4_REPEAT_THRESHOLD = 3   # Same non-trivial text 3+ times at same store → fraud
+L4_RRID_EXACT_THRESHOLD   = 2   # Same RRID, exact same text ≥2 times → fraud
+L4_RRID_SIMILAR_THRESHOLD = 2   # Same RRID, similar text ≥2 times → fraud
+L4_STORE_EXACT_THRESHOLD  = 3   # Same store, exact same text ≥3 times → fraud
+L4_STORE_SIMILAR_THRESHOLD = 4  # Same store, similar text ≥4 times → fraud
 # Lazy/genuine single-word phrases to EXCLUDE from copy-paste detection
 L4_EXCLUDED_PHRASES = {
     "good", "nice", "ok", "okay", "excellent", "very good", "super",
@@ -56,6 +62,22 @@ L4_EXCLUDED_PHRASES = {
     "good store", "very nice", "very excellent", "superb", "outstanding",
     "fantastic", "wonderful", "amazing", "satisfied", "happy", "", "na",
     "n/a", "nil", "none", "bahut acha", "bahut achha", "accha", "achha",
+    # Extended generic phrases
+    "very good experience", "nice experience", "too good", "very helpful",
+    "good work", "keep it up", "well done", "good job",
+    "nice experience overall", "overall good experience",
+    "satisfied with service", "good service overall",
+    # Hindi/transliterated generic phrases
+    "bht acha", "bohot acha", "bohot achha", "acha",
+    "sab sahi hai", "sab theek hai", "theek hai", "bilkul sahi",
+    # More English variants
+    "overall good", "all good overall", "good overall",
+    "everything good", "everything was good", "everything is good",
+    "nice shop", "good shop", "good store experience", "nice store experience",
+    "happy with service", "happy with experience",
+    "completely satisfied", "fully satisfied",
+    "no complaints", "no issues", "no problem", "no problems",
+    "carry on", "keep up the good work",
 }
 
 # ── Layer 5: Scoring Contradictions ──────────────────────────────────────────
@@ -75,7 +97,10 @@ LAYER_WEIGHTS = {
     "layer1": 35,
     "layer2": 20,
     "layer3": 20,
-    "layer4": 15,
+    "layer4_rrid_exact":   40,
+    "layer4_rrid_similar": 35,
+    "layer4_store_exact":  25,
+    "layer4_store_similar": 15,
     "layer5": 35,
 }
 IS_FRAUD_THRESHOLD = 1   # Flag if ≥1 layer triggered
@@ -85,7 +110,8 @@ BQ_PROJECT_ID = "fynd-jio-impetus-prod"
 BQ_DATASET    = "nps_data"
 BQ_TABLE      = "nps_responses_06_03_2026"
 BQ_QUERY      = (
-    f"SELECT {RRID_COL}, {STORE_COL}, {DATE_COL}, {NPS_COL}, {ANSWERS_COL}, {FEEDBACK_COL} "
+    f"SELECT {RRID_COL}, {STORE_COL}, {DATE_COL}, {NPS_COL}, {ANSWERS_COL}, {FEEDBACK_COL}, "
+    f"entity_geo "
     f"FROM `{BQ_PROJECT_ID}.{BQ_DATASET}.{BQ_TABLE}` "
     f"WHERE account_id = 1"
 )

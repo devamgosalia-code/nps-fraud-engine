@@ -17,7 +17,7 @@ from config import (
 )
 
 
-def _nps(scores: pd.Series) -> float:
+def nps(scores: pd.Series) -> float:
     """Compute NPS from a series of 0–10 scores. Returns 0.0 if empty."""
     valid = scores.dropna()
     if len(valid) == 0:
@@ -48,8 +48,8 @@ def compute_overall_nps(scored_df: pd.DataFrame) -> dict:
     clean_mask   = ~scored_df["is_fraud"]
     clean_scores = scored_df.loc[clean_mask, NPS_COL]
 
-    reported_nps = _nps(all_scores)
-    clean_nps    = _nps(clean_scores)
+    reported_nps = nps(all_scores)
+    clean_nps    = nps(clean_scores)
 
     cats           = scored_df[NPS_COL].apply(_classify)
     clean_cats     = scored_df.loc[clean_mask, NPS_COL].apply(_classify)
@@ -115,12 +115,21 @@ def compute_store_nps(
     out["nps_inflation"] = (out["reported_nps"] - out["clean_nps"]).round(1)
 
     # Join contamination data
-    if store_health is not None:
-        keep = [c for c in [
-            STORE_COL, "is_contaminated", "dup_ratio",
-            "heavy_dup_count", "perfect_rate", "contamination_reason"
-        ] if c in store_health.columns]
-        out = out.merge(store_health[keep], on=STORE_COL, how="left")
+    if store_health is not None and len(store_health) > 0:
+        # Get set of contaminated stores (stores with at least one contaminated window)
+        contaminated_store_set = set(store_health[STORE_COL].unique())
+        out["is_contaminated"] = out[STORE_COL].isin(contaminated_store_set)
+        
+        # Aggregate window-level metrics to store level (take max/mean as appropriate)
+        store_agg = store_health.groupby(STORE_COL).agg({
+            "dup_ratio": "max",
+            "heavy_dup_count": "max",
+            "perfect_rate": "max",
+            "contamination_reason": lambda x: "|".join(x.unique()) if len(x) > 0 else ""
+        }).reset_index()
+        out = out.merge(store_agg, on=STORE_COL, how="left")
+    else:
+        out["is_contaminated"] = False
 
     # Vectorized risk level
     fp = out["fraud_pct"]
@@ -144,8 +153,8 @@ def compute_nps_trend(scored_df: pd.DataFrame, freq: str = "D") -> pd.DataFrame:
         clean = grp[~grp["is_fraud"]]
         rows.append({
             "date":             period,
-            "reported_nps":     _nps(grp[NPS_COL]),
-            "clean_nps":        _nps(clean[NPS_COL]),
+            "reported_nps":     nps(grp[NPS_COL]),
+            "clean_nps":        nps(clean[NPS_COL]),
             "total_responses":  len(grp),
             "fraud_count":      int(grp["is_fraud"].sum()),
         })
@@ -159,7 +168,10 @@ def compute_layer_breakdown(scored_df: pd.DataFrame) -> pd.DataFrame:
         "RRID_LIGHT_DUP":             "L1 · Light Duplicate RRID",
         "CONTAMINATED_STORE_PERFECT": "L2 · Contaminated Store Perfect",
         "VELOCITY_ANOMALY":           "L3 · Velocity Anomaly",
-        "REPEATED_FEEDBACK":          "L4 · Copy-Paste Feedback",
+        "RRID_EXACT_COPY":            "L4 · RRID Exact Copy",
+        "RRID_SIMILAR_COPY":          "L4 · RRID Similar Copy",
+        "STORE_EXACT_COPY":           "L4 · Store Exact Copy",
+        "STORE_SIMILAR_COPY":         "L4 · Store Similar Copy",
         "MONOTONE_MISMATCH":          "L5 · Monotone Mismatch",
         "EXTREME_CONTRADICTION":      "L5 · Extreme Contradiction",
         "REVERSE_CONTRADICTION":      "L5 · Reverse Contradiction",

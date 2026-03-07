@@ -21,43 +21,55 @@ from config import (
 )
 
 
-def _parse_answers_json(raw: str) -> dict:
+def _parse_answers(raw) -> dict:
     """
-    Parse one cell of the answers JSON column.
+    Parse one cell of the answers column.
 
-    Extracts:
-      - Numeric sub-ratings for each question in SUB_RATING_QUESTIONS
-      - The verbatim text from the 'other_feedback' question_id
+    Handles three formats:
+      A) JSON string (nested):  '{"answers": [{...}]}'
+      B) JSON string (bare):    '[{...}]'
+      C) Native list/ndarray:   [{...}, ...]  ← BigQuery RECORD
 
     Returns a flat dict:
-      { "staff_friendliness_service": 5.0, ..., "_verbatim": "Good service by Ashok" }
+      { "staff_friendliness_service": 5.0, ..., "_verbatim": "Good service" }
     """
     result = {}
-    if not isinstance(raw, str) or not raw.strip():
+
+    # Determine the answers list from various input formats
+    answers = []
+    if isinstance(raw, (list, np.ndarray)):
+        # BigQuery returns REPEATED RECORD as list/ndarray of dicts
+        answers = list(raw)
+    elif isinstance(raw, str) and raw.strip():
+        try:
+            data = json.loads(raw)
+            if isinstance(data, dict):
+                answers = data.get("answers", [])
+            elif isinstance(data, list):
+                answers = data
+        except (json.JSONDecodeError, TypeError):
+            return result
+    else:
         return result
-    try:
-        data = json.loads(raw)
-        answers = data.get("answers", [])
-        for item in answers:
-            qid = item.get("question_id") or item.get("question_code", "")
 
-            # ── Sub-ratings (numeric) ──────────────────────────────────────
-            if qid in SUB_RATING_QUESTIONS:
-                val = item.get("answer_number")
-                if val is not None:
-                    try:
-                        result[qid] = float(val)
-                    except (ValueError, TypeError):
-                        pass
+    for item in answers:
+        if not isinstance(item, dict):
+            continue
+        qid = item.get("question_id") or item.get("question_code", "")
 
-            # ── Verbatim text ──────────────────────────────────────────────
-            if qid == VERBATIM_QUESTION_ID:
-                text = item.get("answer_string")
-                if text and str(text).strip() not in ("", "null", "None"):
-                    result["_verbatim"] = str(text).strip()
+        if qid in SUB_RATING_QUESTIONS:
+            val = item.get("answer_number")
+            if val is not None:
+                try:
+                    result[qid] = float(val)
+                except (ValueError, TypeError):
+                    pass
 
-    except (json.JSONDecodeError, TypeError, AttributeError):
-        pass
+        if qid == VERBATIM_QUESTION_ID:
+            text = item.get("answer_string")
+            if text and str(text).strip() not in ("", "null", "None"):
+                result["_verbatim"] = str(text).strip()
+
     return result
 
 
@@ -74,7 +86,7 @@ def _extract_sub_ratings(df: pd.DataFrame) -> pd.DataFrame:
         df["verbatim"] = ""
         return df
 
-    parsed    = df[ANSWERS_COL].apply(_parse_answers_json)
+    parsed    = df[ANSWERS_COL].apply(_parse_answers)
     ratings_df = pd.DataFrame(parsed.tolist(), index=df.index)
 
     # Sub-rating columns
@@ -92,6 +104,36 @@ def _extract_sub_ratings(df: pd.DataFrame) -> pd.DataFrame:
 
     df["verbatim"] = df["verbatim"].astype(str).str.strip()
 
+    return df
+
+
+def _extract_entity_geo(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Extract store name, city, and state from the entity_geo JSON column.
+    Adds three new columns: store_name, store_city, store_state
+    """
+    if "entity_geo" not in df.columns:
+        df["store_name"] = ""
+        df["store_city"] = ""
+        df["store_state"] = ""
+        return df
+
+    def _parse_geo(raw):
+        try:
+            d = json.loads(raw) if isinstance(raw, str) else raw
+            return {
+                "store_name":  str(d.get("description", "") or "").strip(),
+                "store_city":  str(d.get("city", "") or "").strip().title(),
+                "store_state": str(d.get("state", "") or "").strip().title(),
+            }
+        except:
+            return {"store_name": "", "store_city": "", "store_state": ""}
+
+    geo_parsed = df["entity_geo"].apply(_parse_geo)
+    geo_df = pd.DataFrame(geo_parsed.tolist(), index=df.index)
+    df["store_name"]  = geo_df["store_name"]
+    df["store_city"]  = geo_df["store_city"]
+    df["store_state"] = geo_df["store_state"]
     return df
 
 
@@ -119,12 +161,13 @@ def _compute_derived_fields(df: pd.DataFrame) -> pd.DataFrame:
         df["verbatim"]
         .str.lower()
         .str.strip()
-        .str.replace(r"\s+",       " ",  regex=True)
         .str.replace(r"[^\w\s]",   "",   regex=True)
+        .str.replace(r"\s+",       " ",  regex=True)
+        .str.strip()
     )
 
     # Ensure correct dtypes
-    df[DATE_COL] = pd.to_datetime(df[DATE_COL], errors="coerce")
+    df[DATE_COL] = pd.to_datetime(df[DATE_COL], dayfirst=True, errors="coerce")
     df[NPS_COL]  = pd.to_numeric(df[NPS_COL],   errors="coerce")
 
     return df
@@ -137,7 +180,7 @@ def _get_csv_columns(filepath: str) -> list:
     return [c.strip().strip('"') for c in header.split(",")]
 
 
-@st.cache_data(show_spinner="📂 Loading NPS data — please wait for large files…")
+@st.cache_data(show_spinner="📂 Loading NPS data — please wait for large files…", ttl=0)
 def load_nps_data(filepath: str) -> pd.DataFrame:
     """
     Load the NPS CSV, parse the answers JSON, and compute all derived fields.
@@ -159,6 +202,18 @@ def load_nps_data(filepath: str) -> pd.DataFrame:
     df = pd.read_csv(filepath, low_memory=False)
     print(f"  Loaded {len(df):,} rows × {len(df.columns)} columns")
 
+    # Debug: verify JSON parsing is working
+    sample_raw = df['answers'].iloc[0] if 'answers' in df.columns else None
+    if sample_raw:
+        import json as _j
+        sample_parsed = _j.loads(sample_raw)
+        print(f"  JSON type: {type(sample_parsed)}")
+        if isinstance(sample_parsed, list):
+            print(f"  First item answer_number: {sample_parsed[0].get('answer_number')}")
+        elif isinstance(sample_parsed, dict):
+            answers = sample_parsed.get('answers', [])
+            print(f"  Nested answers count: {len(answers)}")
+
     # Validate required columns
     required = [RRID_COL, STORE_COL, DATE_COL, NPS_COL]
     missing  = [c for c in required if c not in df.columns]
@@ -171,6 +226,21 @@ def load_nps_data(filepath: str) -> pd.DataFrame:
 
     print("  Parsing answers JSON (sub-ratings + verbatims)…")
     df = _extract_sub_ratings(df)
+
+    sr_cols = [c for c in df.columns if c.startswith('sr_')]
+    print(f"  Sub-rating cols extracted: {sr_cols}")
+    if sr_cols:
+        print(f"  Sample sr values row 0: {df[sr_cols].iloc[0].tolist()}")
+        print(f"  is_all_perfect count will be based on these values")
+
+    print("  Extracting entity geo (store name, city, state)…")
+    df = _extract_entity_geo(df)
+
+    df["store_label"] = (
+        df["entity_id"].astype(str) + " · " +
+        df["store_name"].where(df["store_name"] != "", other="") + " · " +
+        df["store_city"] + ", " + df["store_state"]
+    ).str.strip(" · ").str.replace(r" · $", "", regex=True).str.replace(r"^\s*·\s*", "", regex=True)
 
     print("  Computing derived fields…")
     df = _compute_derived_fields(df)
@@ -224,6 +294,15 @@ def load_nps_data_from_bigquery() -> pd.DataFrame:
     print("  Parsing answers JSON (sub-ratings + verbatims)…")
     df = _extract_sub_ratings(df)
 
+    print("  Extracting entity geo (store name, city, state)…")
+    df = _extract_entity_geo(df)
+
+    df["store_label"] = (
+        df["entity_id"].astype(str) + " · " +
+        df["store_name"].where(df["store_name"] != "", other="") + " · " +
+        df["store_city"] + ", " + df["store_state"]
+    ).str.strip(" · ").str.replace(r" · $", "", regex=True).str.replace(r"^\s*·\s*", "", regex=True)
+
     print("  Computing derived fields…")
     df = _compute_derived_fields(df)
 
@@ -232,6 +311,7 @@ def load_nps_data_from_bigquery() -> pd.DataFrame:
     return df
 
 
+@st.cache_data(show_spinner="📂 Processing uploaded file…", ttl=0)
 def load_nps_data_from_bytes(file_bytes: bytes) -> pd.DataFrame:
     """
     Load NPS data from uploaded file bytes (for Streamlit file_uploader).

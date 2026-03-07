@@ -270,12 +270,14 @@ store_nps     = st.session_state.store_nps
 # ─────────────────────────────────────────────────────────────────────────────
 # TABS
 # ─────────────────────────────────────────────────────────────────────────────
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "📊  National Overview",
     "🏪  Store Intelligence",
+    "🗺️  State Intelligence",
     "💬  Verbatim Intelligence",
+    "🚨  Top Fraud RRIDs",
     "🔬  Response Inspector",
-    "📋  Export",
+    "📋  Export & Recommendations",
 ])
 
 
@@ -338,6 +340,50 @@ with tab1:
     fig_l.update_yaxes(autorange="reversed", gridcolor="#181f2e", linecolor="#181f2e")
     st.plotly_chart(fig_l, use_container_width=True)
 
+    # ── Layer Legend ──────────────────────────────────────────────────────
+    st.markdown("### Detection Layer Legend")
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.markdown("""
+        **L1 · Duplicate Phone Number**
+        
+        **Heavy Duplicate** — Same phone submitted 3+ times in 7 days → all responses removed
+        
+        **Light Duplicate** — Same phone submitted exactly twice → only the repeat removed
+        
+        **L2 · Contaminated Store**
+        
+        Store is flagged as contaminated when it has too many duplicate phones or near-perfect scores
+        
+        All perfect-score responses from that store are removed
+        
+        **L3 · Velocity Anomaly**
+        
+        Too many perfect responses from too few phones on a single day → staff filling surveys at billing counter
+        """)
+    
+    with col2:
+        st.markdown("""
+        **L4 · Copy-Paste Feedback**
+        
+        **Phone Exact** — Same phone, same text, 2+ times
+        
+        **Phone Similar** — Same phone, similar text, 2+ times
+        
+        **Store Exact** — Different phones, same text, 3+ times at same store
+        
+        **Store Similar** — Different phones, similar text, 4+ times at same store
+        
+        **L5 · Scoring Contradiction**
+        
+        **Monotone Mismatch** — All sub-ratings identical and low (≤3) but NPS = 10
+        
+        **Extreme Contradiction** — Average sub-rating ≤3 but NPS ≥9
+        
+        **Reverse Contradiction** — Average sub-rating ≥4.5 but NPS ≤3
+        """)
+
     # ── Disposition pie ───────────────────────────────────────────────────
     col_pie, col_trend = st.columns(2)
     with col_pie:
@@ -385,31 +431,117 @@ with tab1:
 with tab2:
     st.markdown("## Store-Level Fraud Intelligence")
 
-    n_cont     = int(store_health["is_contaminated"].sum()) if store_health is not None else "—"
+    n_cont = int(store_health[STORE_COL].nunique()) if (store_health is not None and len(store_health) > 0) else 0
+    n_cont_windows = int(len(store_health)) if store_health is not None else 0
     n_critical = int((store_nps["risk_level"] == "CRITICAL").sum())
     n_high     = int((store_nps["risk_level"] == "HIGH").sum())
 
     c1, c2, c3 = st.columns(3)
-    c1.metric("Contaminated Stores", n_cont)
+    c1.metric("Contaminated Stores", n_cont, 
+              delta=f"{n_cont_windows} contaminated windows",
+              delta_color="off")
     c2.metric("🔴 Critical Risk", n_critical)
     c3.metric("🟠 High Risk", n_high)
 
     risk_filter = st.selectbox("Filter by risk", ["All", "CRITICAL", "HIGH", "MEDIUM", "LOW"])
     disp = store_nps.copy()
+
+    # ── Build fraud reason columns per store ─────────────────────────────────
+    fraud_only = scored_df[
+        scored_df["is_fraud"] & (scored_df["fraud_reasons"].str.len() > 0)
+    ].copy()
+
+    if len(fraud_only) > 0:
+        exploded = (
+            fraud_only[[STORE_COL, "fraud_reasons"]]
+            .assign(reason=fraud_only["fraud_reasons"].str.split("|"))
+            .explode("reason")
+        )
+        exploded["reason"] = exploded["reason"].str.strip()
+        exploded = exploded[exploded["reason"] != ""]
+
+        # Friendly short labels for each flag code
+        flag_labels = {
+            "RRID_HEAVY_DUP":             "L1·HeavyDup",
+            "RRID_LIGHT_DUP":             "L1·LightDup",
+            "CONTAMINATED_STORE_PERFECT": "L2·ContamPerf",
+            "VELOCITY_ANOMALY":           "L3·Velocity",
+            "RRID_EXACT_COPY":            "L4·RRIDExact",
+            "RRID_SIMILAR_COPY":          "L4·RRIDSimilar",
+            "STORE_EXACT_COPY":           "L4·StoreExact",
+            "STORE_SIMILAR_COPY":         "L4·StoreSimilar",
+            "MONOTONE_MISMATCH":          "L5·Monotone",
+            "EXTREME_CONTRADICTION":      "L5·Extreme",
+            "REVERSE_CONTRADICTION":      "L5·Reverse",
+        }
+        exploded["reason_label"] = exploded["reason"].map(flag_labels).fillna(exploded["reason"])
+
+        reason_pivot = (
+            exploded
+            .groupby([STORE_COL, "reason_label"])
+            .size()
+            .reset_index(name="cnt")
+            .pivot_table(
+                index=STORE_COL,
+                columns="reason_label",
+                values="cnt",
+                fill_value=0,
+                aggfunc="sum",
+            )
+            .reset_index()
+        )
+        reason_pivot.columns.name = None
+
+        # Format each reason column as "label (count)" in a single 
+        # "Fraud Reasons" text column for compact display
+        reason_flag_cols = [c for c in reason_pivot.columns if c != STORE_COL]
+
+        def _format_reasons(row):
+            parts = []
+            # Sort by count descending so biggest signal appears first
+            sorted_cols = sorted(reason_flag_cols, key=lambda c: row.get(c, 0), reverse=True)
+            for col in sorted_cols:
+                val = int(row.get(col, 0))
+                if val > 0:
+                    parts.append(f"{col} ({val})")
+            return " · ".join(parts) if parts else "—"
+
+        reason_pivot["Fraud Reasons"] = reason_pivot[reason_flag_cols].apply(
+            _format_reasons, axis=1
+        )
+
+        disp = disp.merge(
+            reason_pivot[[STORE_COL, "Fraud Reasons"]],
+            on=STORE_COL,
+            how="left",
+        )
+        disp["Fraud Reasons"] = disp["Fraud Reasons"].fillna("—")
+    else:
+        disp["Fraud Reasons"] = "—"
+
+    store_meta = scored_df[["entity_id", "store_name", "store_city", "store_state"]].drop_duplicates("entity_id")
+    disp = disp.merge(store_meta, on="entity_id", how="left")
+
     if risk_filter != "All":
         disp = disp[disp["risk_level"] == risk_filter]
 
     show_cols = [c for c in [
-        STORE_COL, "total_responses", "fraud_count", "fraud_pct",
+        STORE_COL, "store_name", "store_city", "store_state",
+        "total_responses", "fraud_count", "fraud_pct",
+        "Fraud Reasons",
         "reported_nps", "clean_nps", "nps_inflation",
         "all_perfect_pct", "risk_level",
     ] if c in disp.columns]
 
     rename = {
         STORE_COL:          "Store",
+        "store_name":       "Store Name",
+        "store_city":       "City",
+        "store_state":      "State",
         "total_responses":  "Total",
         "fraud_count":      "Fraud #",
         "fraud_pct":        "Fraud %",
+        "Fraud Reasons":    "Fraud Reasons",
         "reported_nps":     "Reported NPS",
         "clean_nps":        "✅ Clean NPS",
         "nps_inflation":    "Inflation",
@@ -423,6 +555,11 @@ with tab2:
         column_config={
             "Fraud %": st.column_config.ProgressColumn(
                 "Fraud %", format="%.1f%%", min_value=0, max_value=100),
+            "Fraud Reasons": st.column_config.TextColumn(
+                "Fraud Reasons", 
+                width="large",
+                help="Each fraud flag and how many responses it caught at this store"
+            ),
             "✅ Clean NPS": st.column_config.NumberColumn("✅ Clean NPS", format="%.1f"),
             "Reported NPS": st.column_config.NumberColumn("Reported NPS", format="%.1f"),
             "Inflation":    st.column_config.NumberColumn("Inflation",    format="%.1f"),
@@ -451,9 +588,86 @@ with tab2:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# TAB 3 — VERBATIM INTELLIGENCE
+# TAB 3 — STATE INTELLIGENCE
 # ═════════════════════════════════════════════════════════════════════════════
 with tab3:
+    st.markdown("## State-Level Fraud & NPS Intelligence")
+
+    if "store_state" in scored_df.columns and scored_df["store_state"].notna().any():
+        state_col = "store_state"
+    elif "state" in scored_df.columns:
+        state_col = "state"
+    else:
+        st.warning("No state data found in dataset.")
+        state_col = None
+
+    if state_col is None:
+        st.info("State-level analysis requires a 'state' or 'entity_geo' column.")
+    else:
+        state_rows = []
+        from src.nps_calculator import nps as calc_nps
+        for state, grp in scored_df.groupby(state_col):
+            clean = grp[~grp["is_fraud"]]
+            state_rows.append({
+                "State": state,
+                "Total Responses": len(grp),
+                "Genuine": len(clean),
+                "Fraud": int(grp["is_fraud"].sum()),
+                "Fraud %": round(grp["is_fraud"].mean() * 100, 1),
+                "Reported NPS": calc_nps(grp[NPS_COL]),
+                "Clean NPS": calc_nps(clean[NPS_COL]),
+                "NPS Delta": round(calc_nps(clean[NPS_COL]) - calc_nps(grp[NPS_COL]), 1),
+            })
+
+        state_df = pd.DataFrame(state_rows).sort_values("Fraud %", ascending=False).reset_index(drop=True)
+
+        worst_state = state_df.iloc[0]
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Worst State (Fraud %)", f"{worst_state['State']}", f"{worst_state['Fraud %']}% fraud")
+        c2.metric("States with >20% Fraud", str(len(state_df[state_df["Fraud %"] > 20])))
+        c3.metric("Max NPS Inflation", f"{state_df['NPS Delta'].min()} pts", "most negative = worst")
+
+        st.markdown("### State Fraud Rankings")
+        st.dataframe(
+            state_df,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Fraud %": st.column_config.ProgressColumn("Fraud %", format="%.1f%%", min_value=0, max_value=100),
+                "Reported NPS": st.column_config.NumberColumn("Reported NPS", format="%.1f"),
+                "Clean NPS": st.column_config.NumberColumn("✅ Clean NPS", format="%.1f"),
+                "NPS Delta": st.column_config.NumberColumn("NPS Delta", format="%.1f"),
+            }
+        )
+
+        top_states = state_df[state_df["Fraud %"] > 5].head(20)
+        fig_state = go.Figure()
+        fig_state.add_trace(go.Bar(
+            x=top_states["State"], y=top_states["Reported NPS"],
+            name="Reported NPS", marker_color="#f59e0b"
+        ))
+        fig_state.add_trace(go.Bar(
+            x=top_states["State"], y=top_states["Clean NPS"],
+            name="✅ Clean NPS", marker_color="#22c55e"
+        ))
+        fig_state.update_layout(
+            barmode="group",
+            title=dict(text="Reported vs Clean NPS by State", font=dict(size=13)),
+            xaxis_tickangle=-45,
+            height=420,
+            legend=dict(orientation="h"),
+            paper_bgcolor="#ffffff",
+            plot_bgcolor="#f8fafc",
+            font=dict(family="Inter", color="#475569", size=11),
+            margin=dict(t=44, b=80, l=40, r=16),
+        )
+        st.plotly_chart(fig_state, use_container_width=True)
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# TAB 4 — VERBATIM INTELLIGENCE
+# ═════════════════════════════════════════════════════════════════════════════
+with tab4:
     st.markdown("## Verbatim Intelligence — Staff Coaching Detection")
     st.markdown(
         "Identifies stores where staff are coaching customers to name them in the survey. "
@@ -485,16 +699,28 @@ with tab3:
             coaching_lb["first_seen"] = pd.to_datetime(coaching_lb["first_seen"]).dt.date
             coaching_lb["last_seen"]  = pd.to_datetime(coaching_lb["last_seen"]).dt.date
 
+            lb_store_meta = scored_df[["entity_id", "store_name", "store_city", "store_state"]].drop_duplicates("entity_id")
+            coaching_lb = coaching_lb.merge(lb_store_meta, on="entity_id", how="left")
+
+            lb_display = coaching_lb.rename(columns={
+                STORE_COL:          "Store",
+                "store_name":       "Store Name",
+                "store_city":       "City",
+                "store_state":      "State",
+                "suspected_staff_name": "Staff Name",
+                "mention_count":    "Mentions",
+                "unique_rrids":     "Unique RRIDs",
+                "first_seen":       "First Seen",
+                "last_seen":        "Last Seen",
+                "sample_verbatim":  "Sample Verbatim",
+            })
+            lb_col_order = [c for c in [
+                "Store", "Store Name", "City", "State", "Staff Name",
+                "Mentions", "Unique RRIDs", "First Seen", "Last Seen", "Sample Verbatim",
+            ] if c in lb_display.columns]
+
             st.dataframe(
-                coaching_lb.rename(columns={
-                    STORE_COL:          "Store",
-                    "suspected_staff_name": "Staff Name",
-                    "mention_count":    "Mentions",
-                    "unique_rrids":     "Unique RRIDs",
-                    "first_seen":       "First Seen",
-                    "last_seen":        "Last Seen",
-                    "sample_verbatim":  "Sample Verbatim",
-                }).head(100),
+                lb_display[lb_col_order].head(100),
                 use_container_width=True,
                 hide_index=True,
                 column_config={
@@ -556,6 +782,10 @@ with tab3:
 
     store_df = scored_df[scored_df[STORE_COL] == selected_store].copy()
 
+    store_meta_row = store_df[["store_name", "store_city", "store_state"]].iloc[0] if len(store_df) else None
+    if store_meta_row is not None:
+        st.markdown(f"**{store_meta_row['store_name']}** · {store_meta_row['store_city']}, {store_meta_row['store_state']}")
+
     # Mini store summary
     s_total   = len(store_df)
     s_fraud   = int(store_df["is_fraud"].sum())
@@ -599,6 +829,9 @@ with tab3:
             reasons = str(row.get("fraud_reasons", "")).replace("|", " · ")
             coaching_badge = "🚨 COACHED · " if row.get("staff_coaching_flag") == "STAFF_COACHING" else ""
             name_tag = f"👤 <strong>{staff_name}</strong> · " if staff_name else ""
+            store_city_val = str(row.get("store_city", "")).strip()
+            store_state_val = str(row.get("store_state", "")).strip()
+            location_tag = f"{store_city_val}, {store_state_val} · " if store_city_val else ""
 
             display_text = verbatim
             if staff_name:
@@ -612,7 +845,7 @@ with tab3:
             st.markdown(f"""
             <div class="card-fraud">
                 <div class="text">"{display_text}"</div>
-                <div class="meta">{coaching_badge}{name_tag}NPS <strong>{nps_val}</strong> · {date_str}</div>
+                <div class="meta">{coaching_badge}{name_tag}{location_tag}NPS <strong>{nps_val}</strong> · {date_str}</div>
                 <div class="meta" style="margin-top:3px;color:#dc2626;font-size:10px;font-family:monospace">{reasons}</div>
             </div>
             """, unsafe_allow_html=True)
@@ -634,11 +867,14 @@ with tab3:
                 continue
             date_str = str(row.get(DATE_COL, ""))[:10]
             nps_val  = int(row[NPS_COL]) if not pd.isna(row.get(NPS_COL)) else "—"
+            store_city_val = str(row.get("store_city", "")).strip()
+            store_state_val = str(row.get("store_state", "")).strip()
+            location_tag = f"{store_city_val}, {store_state_val} · " if store_city_val else ""
 
             st.markdown(f"""
             <div class="card-clean">
                 <div class="text">"{verbatim}"</div>
-                <div class="meta">NPS <strong>{nps_val}</strong> · {date_str}</div>
+                <div class="meta">{location_tag}NPS <strong>{nps_val}</strong> · {date_str}</div>
             </div>
             """, unsafe_allow_html=True)
 
@@ -674,24 +910,162 @@ with tab3:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# TAB 4 — RESPONSE INSPECTOR
+# TAB 5 — TOP FRAUD RRIDs
 # ═════════════════════════════════════════════════════════════════════════════
-with tab4:
+with tab5:
+    st.markdown("## 🚨 Top Fraud RRIDs — Ballot Stuffing Evidence")
+    st.markdown("Respondent IDs with the most submissions. These are the strongest evidence of store staff filling surveys.")
+
+    if "fraud_layer_count" in scored_df.columns:
+        rrid_summary = (
+            scored_df[scored_df["is_fraud"]]
+            .groupby(RRID_COL)
+            .agg(
+                submissions=(RRID_COL, "count"),
+                stores=(STORE_COL, "nunique"),
+                store_list=(STORE_COL, lambda x: ", ".join(x.unique()[:3])),
+                all_perfect=("is_all_perfect", "all"),
+                avg_nps=(NPS_COL, "mean"),
+                fraud_layers=("fraud_reasons", "first"),
+                first_seen=(DATE_COL, "min"),
+                last_seen=(DATE_COL, "max"),
+            )
+            .reset_index()
+            .sort_values("submissions", ascending=False)
+        )
+        rrid_summary["all_perfect"] = rrid_summary["all_perfect"].map({True: "YES ✓", False: "No"})
+        rrid_summary["avg_nps"] = rrid_summary["avg_nps"].round(1)
+        rrid_summary["first_seen"] = pd.to_datetime(rrid_summary["first_seen"]).dt.date
+        rrid_summary["last_seen"] = pd.to_datetime(rrid_summary["last_seen"]).dt.date
+
+        # Merge store metadata — pick first store per RRID for display
+        rrid_first_store = scored_df[scored_df["is_fraud"]].drop_duplicates(RRID_COL)[[RRID_COL, STORE_COL]]
+        rrid_summary = rrid_summary.merge(rrid_first_store, on=RRID_COL, how="left")
+        rrid_store_meta = scored_df[["entity_id", "store_name", "store_city", "store_state"]].drop_duplicates("entity_id")
+        rrid_summary = rrid_summary.merge(rrid_store_meta, on="entity_id", how="left")
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Unique Fraud RRIDs", f"{len(rrid_summary):,}")
+        c2.metric("Max Submissions (1 RRID)", f"{int(rrid_summary['submissions'].max())}")
+        c3.metric("RRIDs with 5+ Submissions", f"{len(rrid_summary[rrid_summary['submissions'] >= 5]):,}")
+
+        top20 = rrid_summary.head(20)
+        fig_rrid = go.Figure(go.Bar(
+            x=top20["submissions"],
+            y=top20[RRID_COL].str[:16] + "…",
+            orientation="h",
+            marker_color="#ef4444",
+            text=top20["submissions"],
+            textposition="outside",
+        ))
+        fig_rrid.update_layout(
+            title="Top 20 Worst Offender RRIDs (by submission count)",
+            yaxis=dict(autorange="reversed"),
+            xaxis_title="Number of submissions",
+            height=500,
+            paper_bgcolor="#ffffff",
+            plot_bgcolor="#f8fafc",
+            font=dict(family="Inter", color="#475569", size=11),
+            margin=dict(t=44, b=36, l=180, r=60),
+        )
+        st.plotly_chart(fig_rrid, use_container_width=True)
+
+        st.markdown("### Full RRID Leaderboard")
+        rrid_display = rrid_summary.head(100).rename(columns={
+            RRID_COL: "RRID",
+            "submissions": "Submissions",
+            "stores": "Stores",
+            "store_list": "Store Codes",
+            STORE_COL: "Store",
+            "store_name":  "Store Name",
+            "store_city":  "City",
+            "store_state": "State",
+            "all_perfect": "All Perfect?",
+            "avg_nps": "Avg NPS",
+            "fraud_layers": "Fraud Flags",
+            "first_seen": "First Seen",
+            "last_seen": "Last Seen",
+        })
+        rrid_col_order = [c for c in [
+            "RRID", "Submissions", "Store Codes", "Store Name", "City", "State",
+            "Stores", "All Perfect?", "Avg NPS", "Fraud Flags", "First Seen", "Last Seen",
+        ] if c in rrid_display.columns]
+
+        st.dataframe(
+            rrid_display[rrid_col_order],
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Submissions": st.column_config.ProgressColumn(
+                    "Submissions", format="%d", min_value=0,
+                    max_value=int(rrid_summary["submissions"].max())
+                ),
+                "Fraud Flags": st.column_config.TextColumn("Fraud Flags", width="large"),
+            }
+        )
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# TAB 6 — RESPONSE INSPECTOR
+# ═════════════════════════════════════════════════════════════════════════════
+with tab6:
     st.markdown("## Response Inspector")
 
-    s_col, r_col = st.columns(2)
+    s_col, r_col, state_col, city_col = st.columns(4)
     with s_col:
         store_search = st.text_input("🏪 Filter by Store Code")
     with r_col:
         rrid_search = st.text_input("👤 Filter by RRID")
+    with state_col:
+        # Get unique states for dropdown
+        if "store_state" in scored_df.columns:
+            unique_states = ["All"] + sorted(scored_df["store_state"].dropna().unique().tolist())
+            selected_state = st.selectbox("🗺️ Filter by State", unique_states)
+        else:
+            selected_state = "All"
+    with city_col:
+        # Get unique cities for dropdown (filtered by state if state is selected)
+        if "store_city" in scored_df.columns:
+            city_df = scored_df[["store_city", "store_state"]].dropna()
+            if selected_state != "All" and "store_state" in scored_df.columns:
+                city_df = city_df[city_df["store_state"] == selected_state]
+            unique_cities = ["All"] + sorted(city_df["store_city"].dropna().unique().tolist())
+            selected_city = st.selectbox("🏙️ Filter by City", unique_cities)
+        else:
+            selected_city = "All"
 
-    fraud_only = st.checkbox("Show fraud responses only", value=True)
+    fraud_reason_col, fraud_only_col = st.columns(2)
+    with fraud_reason_col:
+        # Get unique fraud reasons from pipe-delimited fraud_reasons column
+        if "fraud_reasons" in scored_df.columns:
+            all_reasons = scored_df["fraud_reasons"].dropna()
+            if len(all_reasons) > 0:
+                # Split pipe-delimited reasons and get unique values
+                unique_reasons = set()
+                for reasons_str in all_reasons:
+                    if reasons_str and reasons_str.strip():
+                        reasons_list = [r.strip() for r in str(reasons_str).split("|") if r.strip()]
+                        unique_reasons.update(reasons_list)
+                unique_reasons = ["All"] + sorted(list(unique_reasons))
+                selected_fraud_reason = st.selectbox("🚨 Filter by Fraud Reason", unique_reasons)
+            else:
+                selected_fraud_reason = "All"
+        else:
+            selected_fraud_reason = "All"
+    with fraud_only_col:
+        fraud_only = st.checkbox("Show fraud responses only", value=True)
 
     ins = scored_df.copy()
     if store_search.strip():
         ins = ins[ins[STORE_COL].astype(str).str.contains(store_search.strip(), case=False)]
     if rrid_search.strip():
         ins = ins[ins[RRID_COL].astype(str).str.contains(rrid_search.strip(), case=False)]
+    if selected_state != "All" and "store_state" in ins.columns:
+        ins = ins[ins["store_state"] == selected_state]
+    if selected_city != "All" and "store_city" in ins.columns:
+        ins = ins[ins["store_city"] == selected_city]
+    if selected_fraud_reason != "All" and "fraud_reasons" in ins.columns:
+        ins = ins[ins["fraud_reasons"].str.contains(selected_fraud_reason, na=False, case=False)]
     if fraud_only:
         ins = ins[ins["is_fraud"]]
 
@@ -699,7 +1073,8 @@ with tab4:
 
     vb_col = "verbatim" if "verbatim" in ins.columns else "feedback_clean"
     show = [c for c in [
-        RRID_COL, STORE_COL, DATE_COL, NPS_COL, vb_col,
+        RRID_COL, STORE_COL, "store_name", "store_city", "store_state", 
+        DATE_COL, NPS_COL, vb_col,
         "suspected_staff_name", "fraud_score", "fraud_layer_count",
         "fraud_reasons", "disposition",
     ] if c in ins.columns]
@@ -728,9 +1103,9 @@ with tab4:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# TAB 5 — EXPORT
+# TAB 7 — EXPORT & RECOMMENDATIONS
 # ═════════════════════════════════════════════════════════════════════════════
-with tab5:
+with tab7:
     st.markdown("## Data Export")
 
     fraud_df   = scored_df[scored_df["is_fraud"]].copy()
@@ -781,3 +1156,125 @@ with tab5:
         "fraud_score", "fraud_layer_count", "fraud_reasons", "disposition",
     ] if c in fraud_df.columns]
     st.dataframe(fraud_df[pr_cols].head(1000), use_container_width=True, hide_index=True)
+
+    st.markdown("---")
+    st.markdown("## 📌 Recommendations & Action Plan")
+    st.caption("Generated dynamically based on fraud patterns detected in this dataset.")
+
+    recs = []
+
+    # Pull key stats
+    total = len(scored_df)
+    fraud_pct = nps["fraud_pct"]
+    reported = nps["reported_nps"]
+    clean = nps["clean_nps"]
+    inflation = nps["nps_inflation"]
+
+    # Top critical stores
+    critical_stores = store_nps[store_nps["risk_level"] == "CRITICAL"].head(10)
+    critical_store_list = ", ".join(critical_stores[STORE_COL].astype(str).tolist())
+    if len(critical_stores) > 0:
+        recs.append({
+            "Priority": "🔴 IMMEDIATE",
+            "Action": f"Investigate {len(critical_stores)} CRITICAL stores: {critical_store_list}",
+            "Rationale": f"These stores have >40% fraud rates. Store staff are almost certainly filling surveys.",
+            "Impact": f"Removes majority of definitive fraud responses"
+        })
+
+    # Duplicate RRID blocking
+    l1_count = int(scored_df["fraud_reasons"].str.contains("RRID_HEAVY_DUP", na=False).sum())
+    max_submissions = scored_df.groupby(RRID_COL).size().max() if len(scored_df) else 0
+    if l1_count > 0:
+        recs.append({
+            "Priority": "🔴 IMMEDIATE",
+            "Action": f"Block repeat submissions — enforce 1 response per RRID per transaction",
+            "Rationale": f"{l1_count:,} responses flagged for duplicate RRID. Worst offender submitted {max_submissions}x. This single fix eliminates Layer 1 fraud entirely.",
+            "Impact": f"Eliminates {l1_count:,} duplicate responses instantly"
+        })
+
+    # Velocity anomaly = survey at billing counter
+    l3_count = int(scored_df["fraud_reasons"].str.contains("VELOCITY_ANOMALY", na=False).sum())
+    if l3_count > 0:
+        recs.append({
+            "Priority": "🟠 SHORT-TERM",
+            "Action": "Delay survey delivery by 2–24 hours post-transaction",
+            "Rationale": f"{l3_count:,} responses show velocity clustering — many perfect responses in one store on one day. Staff are filling surveys at the billing counter. Delayed delivery prevents this.",
+            "Impact": "Structurally prevents on-site staff-driven fraud"
+        })
+
+    # Copy-paste feedback = attention checks needed
+    l4_rrid_exact  = int(scored_df["fraud_reasons"].str.contains("RRID_EXACT_COPY", na=False).sum())
+    l4_rrid_similar = int(scored_df["fraud_reasons"].str.contains("RRID_SIMILAR_COPY", na=False).sum())
+    l4_store_exact = int(scored_df["fraud_reasons"].str.contains("STORE_EXACT_COPY", na=False).sum())
+    l4_store_similar = int(scored_df["fraud_reasons"].str.contains("STORE_SIMILAR_COPY", na=False).sum())
+    l4_count = l4_rrid_exact + l4_rrid_similar + l4_store_exact + l4_store_similar
+    if l4_count > 0:
+        breakdown = []
+        if l4_rrid_exact:  breakdown.append(f"RRID exact: {l4_rrid_exact:,}")
+        if l4_rrid_similar: breakdown.append(f"RRID similar: {l4_rrid_similar:,}")
+        if l4_store_exact: breakdown.append(f"Store exact: {l4_store_exact:,}")
+        if l4_store_similar: breakdown.append(f"Store similar: {l4_store_similar:,}")
+        recs.append({
+            "Priority": "🟠 SHORT-TERM",
+            "Action": "Introduce 2–3 attention-check questions randomly in survey",
+            "Rationale": f"{l4_count:,} responses flagged for copy-paste feedback ({', '.join(breakdown)}). Identical or near-identical text submitted repeatedly by the same RRID or at the same store. Attention checks will fail staff speed-filling.",
+            "Impact": "Separates lazy-genuine responses from coordinated robo-filling"
+        })
+
+    # Staff coaching detected
+    coaching_count = int((scored_df.get("staff_coaching_flag", pd.Series("")) == "STAFF_COACHING").sum())
+    coached_stores = scored_df[scored_df.get("staff_coaching_flag", pd.Series("")) == "STAFF_COACHING"][STORE_COL].nunique() if coaching_count > 0 else 0
+    if coaching_count > 0:
+        recs.append({
+            "Priority": "🟠 SHORT-TERM",
+            "Action": f"Conduct staff interviews at {coached_stores} stores with coaching signals",
+            "Rationale": f"{coaching_count:,} responses show repeated staff names in verbatims — a strong indicator of managers coaching staff to prompt customers to name them. Investigate these stores directly.",
+            "Impact": "Addresses root behaviour driving coached responses"
+        })
+
+    # High contaminated store count = device fingerprinting
+    cont_count = int(store_health[STORE_COL].nunique()) if (store_health is not None and len(store_health) > 0) else 0
+    if cont_count > 10:
+        recs.append({
+            "Priority": "🟠 SHORT-TERM",
+            "Action": "Add device fingerprinting beyond RRID (IP address, browser, device ID)",
+            "Rationale": f"{cont_count} stores are contaminated. Staff may create new RRIDs to bypass RRID-based blocking. Device fingerprinting catches this workaround.",
+            "Impact": "Closes the gap after RRID blocking is enforced"
+        })
+
+    # Always: real-time pipeline
+    recs.append({
+        "Priority": "🟡 MEDIUM-TERM",
+        "Action": "Build automated fraud scoring into the live NPS pipeline",
+        "Rationale": "Currently fraud is detected retrospectively. These 5 detection layers should run in real-time so fraudulent responses never enter the NPS calculation.",
+        "Impact": "Permanently clean NPS going forward — no manual analysis needed"
+    })
+
+    # High national fraud % = incentive misalignment
+    if fraud_pct > 10:
+        recs.append({
+            "Priority": "🔵 POLICY",
+            "Action": "Decouple store-level NPS from staff incentives and performance targets",
+            "Rationale": f"National fraud rate is {fraud_pct}%. The root cause is incentive misalignment — if staff bonuses depend on NPS, they will game it. Shift to operational metrics (billing speed, return rates).",
+            "Impact": "Removes the motive for fraud at source"
+        })
+
+    # Always: publish clean NPS
+    recs.append({
+        "Priority": "🔵 POLICY",
+        "Action": f"Publish Clean NPS ({clean}) in all internal dashboards — not Reported NPS ({reported})",
+        "Rationale": f"Reported NPS of {reported} is inflated by {inflation} points. Decisions made on this number are based on false data. Clean NPS of {clean} is the only actionable figure.",
+        "Impact": "Ensures every business decision is based on real customer sentiment"
+    })
+
+    st.dataframe(
+        pd.DataFrame(recs),
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Priority": st.column_config.TextColumn("Priority", width="small"),
+            "Action": st.column_config.TextColumn("Action", width="large"),
+            "Rationale": st.column_config.TextColumn("Rationale", width="large"),
+            "Impact": st.column_config.TextColumn("Impact", width="medium"),
+        }
+    )

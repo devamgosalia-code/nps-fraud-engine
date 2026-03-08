@@ -250,34 +250,49 @@ def load_nps_data(filepath: str) -> pd.DataFrame:
     return df
 
 
-@st.cache_data(show_spinner="☁️ Loading NPS data from BigQuery…")
-def load_nps_data_from_bigquery() -> pd.DataFrame:
+def _get_bigquery_client():
     """
-    Load NPS data directly from BigQuery, then run the same
-    sub-rating extraction and derived-field pipeline as CSV loading.
-    Uses gcloud CLI user credentials (no ADC file needed).
+    Create a BigQuery client using the best available auth method:
+      1. Streamlit secrets (for Streamlit Cloud deployment)
+      2. gcloud CLI (for local development)
     """
-    import google.auth
-    import google.auth.transport.requests
-    import subprocess, json as _json
+    from google.cloud import bigquery
 
-    # Get access token from gcloud CLI directly
+    # Method 1: Streamlit secrets (service account JSON)
+    if hasattr(st, "secrets") and "gcp_service_account" in st.secrets:
+        from google.oauth2 import service_account
+        creds = service_account.Credentials.from_service_account_info(
+            st.secrets["gcp_service_account"]
+        )
+        return bigquery.Client(project=BQ_PROJECT_ID, credentials=creds)
+
+    # Method 2: gcloud CLI (local dev)
+    import subprocess
     result = subprocess.run(
         ["gcloud", "auth", "print-access-token"],
         capture_output=True, text=True
     )
     if result.returncode != 0:
         raise RuntimeError(
-            f"gcloud auth failed: {result.stderr.strip()}\n"
-            "Run: gcloud auth login"
+            f"BigQuery auth failed. On Streamlit Cloud, add gcp_service_account "
+            f"to your app secrets. Locally, run: gcloud auth login\n"
+            f"Error: {result.stderr.strip()}"
         )
-    access_token = result.stdout.strip()
-
     from google.oauth2.credentials import Credentials
-    from google.cloud import bigquery
+    return bigquery.Client(
+        project=BQ_PROJECT_ID,
+        credentials=Credentials(token=result.stdout.strip()),
+    )
 
-    credentials = Credentials(token=access_token)
-    client = bigquery.Client(project=BQ_PROJECT_ID, credentials=credentials)
+
+@st.cache_data(show_spinner="☁️ Loading NPS data from BigQuery…")
+def load_nps_data_from_bigquery() -> pd.DataFrame:
+    """
+    Load NPS data directly from BigQuery, then run the same
+    sub-rating extraction and derived-field pipeline as CSV loading.
+    Supports both gcloud CLI (local) and Streamlit secrets (cloud).
+    """
+    client = _get_bigquery_client()
     df = client.query(BQ_QUERY).to_dataframe()
     print(f"  BigQuery returned {len(df):,} rows × {len(df.columns)} columns")
 
@@ -290,6 +305,45 @@ def load_nps_data_from_bigquery() -> pd.DataFrame:
             f"Available columns: {list(df.columns)}\n\n"
             f"Fix: update the column names at the top of config.py"
         )
+
+    print("  Parsing answers JSON (sub-ratings + verbatims)…")
+    df = _extract_sub_ratings(df)
+
+    print("  Extracting entity geo (store name, city, state)…")
+    df = _extract_entity_geo(df)
+
+    df["store_label"] = (
+        df["entity_id"].astype(str) + " · " +
+        df["store_name"].where(df["store_name"] != "", other="") + " · " +
+        df["store_city"] + ", " + df["store_state"]
+    ).str.strip(" · ").str.replace(r" · $", "", regex=True).str.replace(r"^\s*·\s*", "", regex=True)
+
+    print("  Computing derived fields…")
+    df = _compute_derived_fields(df)
+
+    df = df.sort_values([RRID_COL, DATE_COL]).reset_index(drop=True)
+    print(f"  ✅ Done. {len(df):,} responses ready.")
+    return df
+
+
+@st.cache_data(show_spinner="📂 Loading NPS data from parquet…", ttl=0)
+def load_nps_data_from_parquet(filepath: str) -> pd.DataFrame:
+    """
+    Load NPS data from a pre-exported parquet file.
+    Used for Streamlit Cloud deployment where BigQuery is unavailable.
+    """
+    path = Path(filepath)
+    if not path.exists():
+        raise FileNotFoundError(f"Parquet not found: {filepath}")
+
+    print(f"Loading {path.name}…")
+    df = pd.read_parquet(filepath)
+    print(f"  Loaded {len(df):,} rows × {len(df.columns)} columns")
+
+    required = [RRID_COL, STORE_COL, DATE_COL, NPS_COL]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing required columns: {missing}")
 
     print("  Parsing answers JSON (sub-ratings + verbatims)…")
     df = _extract_sub_ratings(df)

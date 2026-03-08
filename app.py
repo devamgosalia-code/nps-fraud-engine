@@ -241,19 +241,9 @@ with st.sidebar:
 # ─────────────────────────────────────────────────────────────────────────────
 # PIPELINE RUNNER
 # ─────────────────────────────────────────────────────────────────────────────
-import os
-
-PARQUET_PATH = os.path.join(os.path.dirname(__file__), "data", "nps_data.parquet")
-
 @st.cache_data(show_spinner=False)
 def _run_pipeline_bigquery():
     df = load_nps_data_from_bigquery()
-    return run_fraud_engine(df)
-
-@st.cache_data(show_spinner=False)
-def _run_pipeline_parquet():
-    from src.loader import load_nps_data_from_parquet
-    df = load_nps_data_from_parquet(PARQUET_PATH)
     return run_fraud_engine(df)
 
 
@@ -266,18 +256,13 @@ def _store_results(scored_df, store_health, name_lb):
 
 
 if st.session_state.scored_df is None:
-    use_parquet = os.path.exists(PARQUET_PATH)
-    source = "parquet" if use_parquet else "BigQuery"
-    with st.spinner(f"Loading from {source} & running fraud engine…"):
+    with st.spinner("Loading from BigQuery & running fraud engine…"):
         try:
-            if use_parquet:
-                scored_df, store_health, name_lb = _run_pipeline_parquet()
-            else:
-                scored_df, store_health, name_lb = _run_pipeline_bigquery()
+            scored_df, store_health, name_lb = _run_pipeline_bigquery()
             _store_results(scored_df, store_health, name_lb)
             st.rerun()
         except Exception as e:
-            st.error(f"Error loading from {source}: {e}")
+            st.error(f"Error loading from BigQuery: {e}")
             st.exception(e)
 
 

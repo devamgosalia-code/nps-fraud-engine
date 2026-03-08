@@ -253,12 +253,26 @@ def load_nps_data(filepath: str) -> pd.DataFrame:
 def _get_bigquery_client():
     """
     Create a BigQuery client using the best available auth method:
-      1. Streamlit secrets (for Streamlit Cloud deployment)
-      2. gcloud CLI (for local development)
+      1. Streamlit secrets — authorized_user refresh token (for Streamlit Cloud)
+      2. Streamlit secrets — service_account JSON (alternative)
+      3. gcloud CLI (for local development)
     """
     from google.cloud import bigquery
 
-    # Method 1: Streamlit secrets (service account JSON)
+    # Method 1: Streamlit secrets — OAuth refresh token (authorized_user)
+    if hasattr(st, "secrets") and "gcp_credentials" in st.secrets:
+        from google.oauth2.credentials import Credentials
+        sec = st.secrets["gcp_credentials"]
+        creds = Credentials(
+            token=None,
+            refresh_token=sec["refresh_token"],
+            client_id=sec["client_id"],
+            client_secret=sec["client_secret"],
+            token_uri="https://oauth2.googleapis.com/token",
+        )
+        return bigquery.Client(project=BQ_PROJECT_ID, credentials=creds)
+
+    # Method 2: Streamlit secrets — service account JSON
     if hasattr(st, "secrets") and "gcp_service_account" in st.secrets:
         from google.oauth2 import service_account
         creds = service_account.Credentials.from_service_account_info(
@@ -266,7 +280,7 @@ def _get_bigquery_client():
         )
         return bigquery.Client(project=BQ_PROJECT_ID, credentials=creds)
 
-    # Method 2: gcloud CLI (local dev)
+    # Method 3: gcloud CLI (local dev)
     import subprocess
     result = subprocess.run(
         ["gcloud", "auth", "print-access-token"],
@@ -274,7 +288,7 @@ def _get_bigquery_client():
     )
     if result.returncode != 0:
         raise RuntimeError(
-            f"BigQuery auth failed. On Streamlit Cloud, add gcp_service_account "
+            f"BigQuery auth failed. On Streamlit Cloud, add gcp_credentials "
             f"to your app secrets. Locally, run: gcloud auth login\n"
             f"Error: {result.stderr.strip()}"
         )

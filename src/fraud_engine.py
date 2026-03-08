@@ -83,16 +83,21 @@ def run_layer1_duplicate_rrid(df: pd.DataFrame) -> pd.Series:
             for i in range(n):
                 if pd.isnull(dates[i]):
                     continue
+                # Find all responses within 7 days of current response
                 window_idxs = [
                     idxs[j] for j in range(n)
                     if not pd.isnull(dates[j])
                     and abs((dates[j] - dates[i]).days) <= L1_WINDOW_DAYS
                 ]
+                # Sort window by date to ensure first is earliest
+                window_idxs = sorted(window_idxs, key=lambda idx: grp_df.loc[idx, DATE_COL])
                 window_n = len(window_idxs)
                 if window_n >= L1_HEAVY_DUP_THRESHOLD:
+                    # 3+ in window → flag ALL responses in window
                     for wi in window_idxs:
                         flags.loc[wi] = "RRID_HEAVY_DUP"
                 elif window_n == L1_LIGHT_DUP_THRESHOLD:
+                    # Exactly 2 in window → flag only the 2nd (non-first) response
                     if idxs[i] != window_idxs[0]:
                         if flags.loc[idxs[i]] == "":
                             flags.loc[idxs[i]] = "RRID_LIGHT_DUP"

@@ -266,11 +266,12 @@ def _store_results(scored_df, store_health, name_lb):
 
 
 if st.session_state.scored_df is None:
-    # Local (has gcloud): use BigQuery for live data
-    # Streamlit Cloud (no gcloud): use parquet snapshot
-    _has_gcloud = os.path.exists(os.path.expanduser("~/.config/gcloud"))
+    # Detect environment: if gcloud CLI exists → BigQuery, else → parquet
+    import shutil
+    _has_gcloud = shutil.which("gcloud") is not None
     use_parquet = os.path.exists(PARQUET_PATH) and not _has_gcloud
     source = "parquet" if use_parquet else "BigQuery"
+    print(f"[ENV] gcloud found: {_has_gcloud}, parquet exists: {os.path.exists(PARQUET_PATH)}, using: {source}")
     with st.spinner(f"Loading from {source} & running fraud engine…"):
         try:
             if use_parquet:

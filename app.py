@@ -245,9 +245,9 @@ with st.sidebar:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PIPELINE RUNNER
+# PIPELINE RUNNER  (background thread so the health check passes immediately)
 # ─────────────────────────────────────────────────────────────────────────────
-import os
+import os, threading
 
 PARQUET_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "nps_data.parquet")
 
@@ -271,95 +271,77 @@ def _store_results(scored_df, store_health, name_lb):
     st.session_state.store_nps        = compute_store_nps(scored_df, store_health)
 
 
+# Shared cache for background loading (survives across reruns)
+if "_bg_result" not in st.session_state:
+    st.session_state._bg_result = None   # will hold (scored_df, store_health, name_lb)
+if "_bg_error" not in st.session_state:
+    st.session_state._bg_error = None
+if "_bg_started" not in st.session_state:
+    st.session_state._bg_started = False
+
+
+@st.cache_resource(show_spinner=False)
+def _start_background_load():
+    """Kick off data loading in a daemon thread. Returns a dict used as shared state."""
+    import time
+    state = {"result": None, "error": None, "done": False}
+
+    def _load():
+        try:
+            use_parquet = os.path.exists(PARQUET_PATH)
+            if use_parquet:
+                res = _run_pipeline_parquet()
+                print("[ENV] Loaded from parquet (background)")
+            else:
+                res = _run_pipeline_bigquery()
+                print("[ENV] Loaded from BigQuery (background)")
+            state["result"] = res
+        except Exception as e1:
+            # Fallback: if primary fails, try the other source
+            try:
+                if os.path.exists(PARQUET_PATH) and not use_parquet:
+                    res = _run_pipeline_parquet()
+                    print("[ENV] Fallback: loaded from parquet (background)")
+                elif use_parquet:
+                    res = _run_pipeline_bigquery()
+                    print("[ENV] Fallback: loaded from BigQuery (background)")
+                else:
+                    raise e1
+                state["result"] = res
+            except Exception as e2:
+                state["error"] = str(e2)
+        state["done"] = True
+
+    t = threading.Thread(target=_load, daemon=True)
+    t.start()
+    return state
+
+
 # ─────────────────────────────────────────────────────────────────────────────
-# MAIN CONTENT HEADER - Render immediately for health check
+# MAIN CONTENT HEADER — renders instantly so health check passes
 # ─────────────────────────────────────────────────────────────────────────────
 st.markdown("# NPS Fraud Detection Engine")
 st.markdown("*Reported NPS · Clean NPS · Store Intelligence · Verbatim Analysis*")
 st.markdown("---")
 
-# Data loading happens AFTER initial render to allow health check to pass
 if st.session_state.scored_df is None:
-    # Use parquet if available (both local and Streamlit Cloud), otherwise BigQuery
-    use_parquet = os.path.exists(PARQUET_PATH)
-    source = "parquet" if use_parquet else "BigQuery"
-    
-    # Create placeholder that renders immediately
-    loading_placeholder = st.empty()
-    with loading_placeholder.container():
-        st.markdown("### 🔍 Loading NPS Fraud Engine...")
-        st.info(f"Loading data from {source}. This may take a minute for large datasets.")
-    
-    # Load data (this will take time but page has already responded)
-    try:
-        if use_parquet:
-            scored_df, store_health, name_lb = _run_pipeline_parquet()
-            print(f"[ENV] Loaded from parquet")
-        else:
-            scored_df, store_health, name_lb = _run_pipeline_bigquery()
-            print(f"[ENV] Loaded from BigQuery")
-        
-        if scored_df is not None and len(scored_df) > 0:
-            loading_placeholder.empty()  # Clear loading message
-            _store_results(scored_df, store_health, name_lb)
-            st.rerun()
-        else:
-            loading_placeholder.empty()
-            st.error("Data loading returned empty dataset. Please check your data source.")
-            st.stop()
-    except (RuntimeError, FileNotFoundError) as e:
-        # If BigQuery fails and parquet exists, try parquet as fallback
-        if not use_parquet and os.path.exists(PARQUET_PATH):
-            error_msg = str(e)
-            if "BigQuery auth failed" in error_msg or "auth" in error_msg.lower():
-                loading_placeholder.empty()
-                st.warning(f"BigQuery authentication failed: {e}")
-                st.info("Falling back to parquet file...")
-                try:
-                    scored_df, store_health, name_lb = _run_pipeline_parquet()
-                    if scored_df is not None and len(scored_df) > 0:
-                        _store_results(scored_df, store_health, name_lb)
-                        st.rerun()
-                    else:
-                        st.error("Parquet file also returned empty dataset.")
-                        st.stop()
-                except Exception as e2:
-                    st.error(f"Error loading from parquet fallback: {e2}")
-                    st.exception(e2)
-                    st.stop()
-            else:
-                loading_placeholder.empty()
-                st.error(f"Error loading data: {e}")
-                st.exception(e)
-                st.stop()
-        # If parquet file fails, try BigQuery as fallback
-        elif use_parquet:
-            loading_placeholder.empty()
-            st.warning(f"Parquet file error: {e}")
-            st.info("Falling back to BigQuery...")
-            try:
-                scored_df, store_health, name_lb = _run_pipeline_bigquery()
-                if scored_df is not None and len(scored_df) > 0:
-                    _store_results(scored_df, store_health, name_lb)
-                    st.rerun()
-                else:
-                    st.error("BigQuery also returned empty dataset.")
-                    st.stop()
-            except Exception as e2:
-                st.error(f"Error loading from BigQuery fallback: {e2}")
-                st.exception(e2)
-                st.stop()
-        else:
-            loading_placeholder.empty()
-            st.error(f"Error loading data: {e}")
-            st.exception(e)
-            st.stop()
-    except Exception as e:
-        loading_placeholder.empty()
-        st.error(f"Error loading data: {e}")
-        st.exception(e)
-        # Prevent app from crashing - allow user to retry
+    # Start background loading (cached — only runs once)
+    bg = _start_background_load()
+
+    if bg["done"] and bg["result"] is not None:
+        scored_df, store_health, name_lb = bg["result"]
+        _store_results(scored_df, store_health, name_lb)
+        st.rerun()
+    elif bg["done"] and bg["error"] is not None:
+        st.error(f"Failed to load data: {bg['error']}")
         st.stop()
+    else:
+        # Still loading — show a friendly message and auto-refresh
+        import time
+        source = "parquet" if os.path.exists(PARQUET_PATH) else "BigQuery"
+        st.info(f"Loading data from {source} & running fraud engine… This page will refresh automatically.")
+        time.sleep(3)
+        st.rerun()
 
 
 # ── Pull from session state ───────────────────────────────────────────────────

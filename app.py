@@ -14,7 +14,21 @@ import plotly.graph_objects as go
 import plotly.express as px
 from datetime import datetime
 
-from config import STORE_COL, RRID_COL, DATE_COL, NPS_COL
+# Import with error handling to prevent crashes during startup
+try:
+    from config import STORE_COL, RRID_COL, DATE_COL, NPS_COL
+    from src.loader import load_nps_data_from_bigquery, get_data_summary
+    from src.fraud_engine import run_fraud_engine
+    from src.nps_calculator import (
+        compute_overall_nps,
+        compute_store_nps,
+        compute_nps_trend,
+        compute_layer_breakdown,
+    )
+except Exception as e:
+    st.error(f"Error importing modules: {e}")
+    st.exception(e)
+    st.stop()
 
 
 def format_date_with_ordinal(date_val):
@@ -57,14 +71,6 @@ def format_date_with_ordinal(date_val):
     month_abbr = datetime(year, month, day).strftime("%b")
     
     return f"{day}{suffix} {month_abbr}, {year}"
-from src.loader import load_nps_data_from_bigquery, get_data_summary
-from src.fraud_engine import run_fraud_engine
-from src.nps_calculator import (
-    compute_overall_nps,
-    compute_store_nps,
-    compute_nps_trend,
-    compute_layer_breakdown,
-)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PAGE CONFIG
@@ -266,27 +272,76 @@ def _store_results(scored_df, store_health, name_lb):
 
 
 if st.session_state.scored_df is None:
-    # Try BigQuery first, fall back to parquet on any failure
-    with st.spinner("Loading data & running fraud engine…"):
+    # Use parquet if available (both local and Streamlit Cloud), otherwise BigQuery
+    use_parquet = os.path.exists(PARQUET_PATH)
+    source = "parquet" if use_parquet else "BigQuery"
+    
+    # Show loading state immediately to allow health check to pass
+    st.markdown("### Loading data...")
+    
+    with st.spinner(f"Loading from {source} & running fraud engine…"):
         try:
-            scored_df, store_health, name_lb = _run_pipeline_bigquery()
-            print("[ENV] Loaded from BigQuery")
-            _store_results(scored_df, store_health, name_lb)
-            st.rerun()
-        except Exception as bq_err:
-            print(f"[ENV] BigQuery failed: {bq_err}")
-            if os.path.exists(PARQUET_PATH):
-                try:
-                    scored_df, store_health, name_lb = _run_pipeline_parquet()
-                    print("[ENV] Loaded from parquet fallback")
-                    _store_results(scored_df, store_health, name_lb)
-                    st.rerun()
-                except Exception as pq_err:
-                    st.error(f"Both BigQuery and parquet failed.\nBQ: {bq_err}\nParquet: {pq_err}")
-                    st.exception(pq_err)
+            if use_parquet:
+                scored_df, store_health, name_lb = _run_pipeline_parquet()
+                print(f"[ENV] Loaded from parquet")
             else:
-                st.error(f"BigQuery failed and no parquet fallback found at {PARQUET_PATH}")
-                st.exception(bq_err)
+                scored_df, store_health, name_lb = _run_pipeline_bigquery()
+                print(f"[ENV] Loaded from BigQuery")
+            
+            if scored_df is not None and len(scored_df) > 0:
+                _store_results(scored_df, store_health, name_lb)
+                st.rerun()
+            else:
+                st.error("Data loading returned empty dataset. Please check your data source.")
+                st.stop()
+        except (RuntimeError, FileNotFoundError) as e:
+            # If BigQuery fails and parquet exists, try parquet as fallback
+            if not use_parquet and os.path.exists(PARQUET_PATH):
+                error_msg = str(e)
+                if "BigQuery auth failed" in error_msg or "auth" in error_msg.lower():
+                    st.warning(f"BigQuery authentication failed: {e}")
+                    st.info("Falling back to parquet file...")
+                    try:
+                        scored_df, store_health, name_lb = _run_pipeline_parquet()
+                        if scored_df is not None and len(scored_df) > 0:
+                            _store_results(scored_df, store_health, name_lb)
+                            st.rerun()
+                        else:
+                            st.error("Parquet file also returned empty dataset.")
+                            st.stop()
+                    except Exception as e2:
+                        st.error(f"Error loading from parquet fallback: {e2}")
+                        st.exception(e2)
+                        st.stop()
+                else:
+                    st.error(f"Error loading data: {e}")
+                    st.exception(e)
+                    st.stop()
+            # If parquet file fails, try BigQuery as fallback
+            elif use_parquet:
+                st.warning(f"Parquet file not found: {e}")
+                st.info("Falling back to BigQuery...")
+                try:
+                    scored_df, store_health, name_lb = _run_pipeline_bigquery()
+                    if scored_df is not None and len(scored_df) > 0:
+                        _store_results(scored_df, store_health, name_lb)
+                        st.rerun()
+                    else:
+                        st.error("BigQuery also returned empty dataset.")
+                        st.stop()
+                except Exception as e2:
+                    st.error(f"Error loading from BigQuery fallback: {e2}")
+                    st.exception(e2)
+                    st.stop()
+            else:
+                st.error(f"Error loading data: {e}")
+                st.exception(e)
+                st.stop()
+        except Exception as e:
+            st.error(f"Error loading data: {e}")
+            st.exception(e)
+            # Prevent app from crashing - allow user to retry
+            st.stop()
 
 
 # ─────────────────────────────────────────────────────────────────────────────

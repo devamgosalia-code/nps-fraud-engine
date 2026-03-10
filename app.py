@@ -266,23 +266,27 @@ def _store_results(scored_df, store_health, name_lb):
 
 
 if st.session_state.scored_df is None:
-    # Detect environment: if gcloud CLI exists → BigQuery, else → parquet
-    import shutil
-    _has_gcloud = shutil.which("gcloud") is not None
-    use_parquet = os.path.exists(PARQUET_PATH) and not _has_gcloud
-    source = "parquet" if use_parquet else "BigQuery"
-    print(f"[ENV] gcloud found: {_has_gcloud}, parquet exists: {os.path.exists(PARQUET_PATH)}, using: {source}")
-    with st.spinner(f"Loading from {source} & running fraud engine…"):
+    # Try BigQuery first, fall back to parquet on any failure
+    with st.spinner("Loading data & running fraud engine…"):
         try:
-            if use_parquet:
-                scored_df, store_health, name_lb = _run_pipeline_parquet()
-            else:
-                scored_df, store_health, name_lb = _run_pipeline_bigquery()
+            scored_df, store_health, name_lb = _run_pipeline_bigquery()
+            print("[ENV] Loaded from BigQuery")
             _store_results(scored_df, store_health, name_lb)
             st.rerun()
-        except Exception as e:
-            st.error(f"Error loading from {source}: {e}")
-            st.exception(e)
+        except Exception as bq_err:
+            print(f"[ENV] BigQuery failed: {bq_err}")
+            if os.path.exists(PARQUET_PATH):
+                try:
+                    scored_df, store_health, name_lb = _run_pipeline_parquet()
+                    print("[ENV] Loaded from parquet fallback")
+                    _store_results(scored_df, store_health, name_lb)
+                    st.rerun()
+                except Exception as pq_err:
+                    st.error(f"Both BigQuery and parquet failed.\nBQ: {bq_err}\nParquet: {pq_err}")
+                    st.exception(pq_err)
+            else:
+                st.error(f"BigQuery failed and no parquet fallback found at {PARQUET_PATH}")
+                st.exception(bq_err)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

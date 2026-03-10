@@ -36,10 +36,13 @@ L1_HEAVY_DUP_THRESHOLD = 3    # 3+ submissions from same RRID → ALL flagged
 L1_LIGHT_DUP_THRESHOLD = 2    # Exactly 2 → only 2nd flagged
 
 # ── Layer 2: Store Contamination ─────────────────────────────────────────────
-L2_DUP_RATIO_THRESHOLD       = 0.30   # >30% of store responses from repeat RRIDs
-L2_HEAVY_DUP_COUNT_MIN       = 5      # ≥5 responses from RRIDs with 3+ submissions
-L2_ALL_PERFECT_RATE          = 0.90   # >90% all-perfect rate at store
-L2_ALL_PERFECT_MIN_RESPONSES = 15     # Minimum responses before rate check applies
+L2_WINDOW_DAYS               = 7      # Rolling window days
+L2_DUP_RATIO_THRESHOLD       = 0.30   # >30% responses from repeat RRIDs in window
+L2_HEAVY_DUP_COUNT_MIN       = 5      # ≥5 responses from RRIDs submitting 3+ times in window
+L2_ALL_PERFECT_RATE          = 0.90   # >90% all-perfect rate in window
+L2_ALL_PERFECT_MIN_RESPONSES = 15     # Minimum responses in window before rate check applies
+ALL_PERFECT_MIN_RATING       = 5      # Sub-rating >= this = counts toward all-perfect
+ALL_PERFECT_MIN_NPS          = 10     # NPS >= this = counts toward all-perfect
 
 # ── Layer 3: Response Velocity Anomaly ───────────────────────────────────────
 L3_MIN_RESPONSES         = 6     # ≥6 responses in a store-day (P95 of clean stores)

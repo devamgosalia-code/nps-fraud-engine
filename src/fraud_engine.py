@@ -12,7 +12,7 @@ from typing import Tuple
 from config import (
     RRID_COL, STORE_COL, DATE_COL, NPS_COL,
     L1_WINDOW_DAYS, L1_HEAVY_DUP_THRESHOLD, L1_LIGHT_DUP_THRESHOLD,
-    L2_DUP_RATIO_THRESHOLD, L2_HEAVY_DUP_COUNT_MIN,
+    L2_WINDOW_DAYS, L2_DUP_RATIO_THRESHOLD, L2_HEAVY_DUP_COUNT_MIN,
     L2_ALL_PERFECT_RATE, L2_ALL_PERFECT_MIN_RESPONSES,
     L3_MIN_RESPONSES, L3_UNIQUE_RRID_RATIO_MAX, L3_PERFECT_RATE_MIN,
     L4_RRID_EXACT_THRESHOLD, L4_RRID_SIMILAR_THRESHOLD,
@@ -83,16 +83,21 @@ def run_layer1_duplicate_rrid(df: pd.DataFrame) -> pd.Series:
             for i in range(n):
                 if pd.isnull(dates[i]):
                     continue
+                # Find all responses within 7 days of current response
                 window_idxs = [
                     idxs[j] for j in range(n)
                     if not pd.isnull(dates[j])
                     and abs((dates[j] - dates[i]).days) <= L1_WINDOW_DAYS
                 ]
+                # Sort window by date to ensure first is earliest
+                window_idxs = sorted(window_idxs, key=lambda idx: grp_df.loc[idx, DATE_COL])
                 window_n = len(window_idxs)
                 if window_n >= L1_HEAVY_DUP_THRESHOLD:
+                    # 3+ in window → flag ALL responses in window
                     for wi in window_idxs:
                         flags.loc[wi] = "RRID_HEAVY_DUP"
                 elif window_n == L1_LIGHT_DUP_THRESHOLD:
+                    # Exactly 2 in window → flag only the 2nd (non-first) response
                     if idxs[i] != window_idxs[0]:
                         if flags.loc[idxs[i]] == "":
                             flags.loc[idxs[i]] = "RRID_LIGHT_DUP"
@@ -108,57 +113,121 @@ def compute_store_contamination(
     df: pd.DataFrame, layer1_flags: pd.Series
 ) -> pd.DataFrame:
     """
-    Classify each store as contaminated or clean.
+    Classify each (store, 7-day window) pair as contaminated or clean.
+    Vectorized version — uses groupby + rolling-style aggregation per store-week.
 
-    A store is contaminated if ANY condition is met (PRD §3.2):
-      1. Duplicate RRID ratio > 30%
-      2. Heavy duplicate count ≥ 5
-      3. All-perfect rate > 90%  AND  ≥15 total responses
+    Groups by (store, week) where week = date floored to 7-day periods.
+    Within each group computes:
+      1. dup_ratio    — % of responses from RRIDs appearing 2+ times
+      2. heavy_dups   — count of responses from RRIDs appearing 3+ times
+      3. perfect_rate — % of responses that are all-perfect
 
-    Returns: DataFrame indexed by STORE_COL with health metrics.
+    Returns:
+      DataFrame with one row per contaminated (store, window_start) pair.
     """
-    tmp = df[[STORE_COL, RRID_COL, "is_all_perfect"]].copy()
-    tmp["_l1"] = layer1_flags.values
+    tmp = df[[STORE_COL, RRID_COL, DATE_COL, "is_all_perfect"]].copy()
+    tmp = tmp.dropna(subset=[DATE_COL])
 
-    store_stats = tmp.groupby(STORE_COL).agg(
-        total_responses    = (RRID_COL,        "count"),
-        unique_rrids       = (RRID_COL,        "nunique"),
-        all_perfect_count  = ("is_all_perfect", "sum"),
-        heavy_dup_count    = ("_l1",            lambda x: (x == "RRID_HEAVY_DUP").sum()),
-        dup_responses      = ("_l1",            lambda x: x.isin(["RRID_HEAVY_DUP", "RRID_LIGHT_DUP"]).sum()),
-    ).reset_index()
+    if len(tmp) == 0:
+        return pd.DataFrame()
 
-    store_stats["dup_ratio"]    = store_stats["dup_responses"] / store_stats["total_responses"].clip(lower=1)
-    store_stats["perfect_rate"] = store_stats["all_perfect_count"] / store_stats["total_responses"].clip(lower=1)
+    # Assign each response to a 7-day window bucket based on its date
+    min_date = tmp[DATE_COL].min()
+    tmp["_week"] = ((tmp[DATE_COL] - min_date).dt.days // L2_WINDOW_DAYS).astype(int)
 
-    crit1 = store_stats["dup_ratio"]     > L2_DUP_RATIO_THRESHOLD
-    crit2 = store_stats["heavy_dup_count"] >= L2_HEAVY_DUP_COUNT_MIN
-    crit3 = (store_stats["perfect_rate"] > L2_ALL_PERFECT_RATE) & \
-            (store_stats["total_responses"] >= L2_ALL_PERFECT_MIN_RESPONSES)
+    contaminated_windows = []
 
-    store_stats["contamination_reason"] = ""
-    store_stats.loc[crit1, "contamination_reason"] += "HIGH_DUP_RATIO|"
-    store_stats.loc[crit2, "contamination_reason"] += "HEAVY_DUP_COUNT|"
-    store_stats.loc[crit3, "contamination_reason"] += "HIGH_PERFECT_RATE|"
-    store_stats["contamination_reason"] = store_stats["contamination_reason"].str.rstrip("|")
-    store_stats["is_contaminated"]      = crit1 | crit2 | crit3
+    for (store, week), grp in tmp.groupby([STORE_COL, "_week"]):
+        total = len(grp)
+        if total == 0:
+            continue
 
-    return store_stats
+        window_start = grp[DATE_COL].min()
+        window_end = window_start + pd.Timedelta(days=L2_WINDOW_DAYS)
+
+        # Metric 1: Duplicate RRID ratio within window
+        rrid_counts = grp[RRID_COL].value_counts()
+        dup_rrids = set(rrid_counts[rrid_counts >= 2].index)
+        dup_responses = grp[RRID_COL].isin(dup_rrids).sum() if dup_rrids else 0
+        dup_ratio = dup_responses / total
+
+        # Metric 2: Heavy duplicate count
+        heavy_rrids = set(rrid_counts[rrid_counts >= L1_HEAVY_DUP_THRESHOLD].index)
+        heavy_dup_count = grp[RRID_COL].isin(heavy_rrids).sum() if heavy_rrids else 0
+
+        # Metric 3: All-perfect rate
+        perfect_count = grp["is_all_perfect"].sum()
+        perfect_rate = perfect_count / total
+
+        # Check contamination thresholds
+        crit1 = dup_ratio > L2_DUP_RATIO_THRESHOLD
+        crit2 = heavy_dup_count >= L2_HEAVY_DUP_COUNT_MIN
+        crit3 = (perfect_rate > L2_ALL_PERFECT_RATE) and (total >= L2_ALL_PERFECT_MIN_RESPONSES)
+
+        if crit1 or crit2 or crit3:
+            reason_parts = []
+            if crit1: reason_parts.append(f"HIGH_DUP_RATIO({dup_ratio:.0%})")
+            if crit2: reason_parts.append(f"HEAVY_DUP_COUNT({heavy_dup_count})")
+            if crit3: reason_parts.append(f"HIGH_PERFECT_RATE({perfect_rate:.0%})")
+
+            contaminated_windows.append({
+                STORE_COL:              store,
+                "window_start":         window_start,
+                "window_end":           window_end,
+                "contamination_reason": "|".join(reason_parts),
+                "total_responses":      total,
+                "dup_ratio":            round(dup_ratio, 3),
+                "heavy_dup_count":      int(heavy_dup_count),
+                "perfect_rate":         round(perfect_rate, 3),
+                "is_contaminated":      True,
+            })
+
+    if len(contaminated_windows) == 0:
+        print("  → No contaminated windows found")
+        return pd.DataFrame(columns=[
+            STORE_COL, "window_start", "window_end",
+            "contamination_reason", "total_responses",
+            "dup_ratio", "heavy_dup_count", "perfect_rate", "is_contaminated"
+        ])
+
+    result = pd.DataFrame(contaminated_windows)
+    print(f"  → {len(result)} contaminated (store, window) pairs found "
+          f"across {result[STORE_COL].nunique()} stores")
+    return result
 
 
 def run_layer2_store_contamination(
     df: pd.DataFrame, store_contamination: pd.DataFrame
 ) -> pd.Series:
     """
-    Flag all-perfect responses from contaminated stores.
-    Non-perfect responses at contaminated stores are NOT flagged.
+    Flag all-perfect responses that fall within a contaminated
+    (store, 7-day window) pair. Vectorized using merge.
     """
-    contaminated = set(
-        store_contamination.loc[store_contamination["is_contaminated"], STORE_COL]
-    )
     flags = pd.Series("", index=df.index, dtype=str)
-    mask  = df[STORE_COL].isin(contaminated) & df["is_all_perfect"]
-    flags[mask] = "CONTAMINATED_STORE_PERFECT"
+
+    if store_contamination is None or len(store_contamination) == 0:
+        return flags
+
+    # Build a lookup of contaminated stores with their windows
+    contam = store_contamination[[STORE_COL, "window_start", "window_end"]].copy()
+
+    # Only consider all-perfect responses
+    perfect_mask = df["is_all_perfect"] == True
+    candidates = df.loc[perfect_mask, [STORE_COL, DATE_COL]].copy()
+    candidates["_idx"] = candidates.index
+
+    # Cross-join candidates with contaminated windows on store
+    merged = candidates.merge(contam, on=STORE_COL, how="inner")
+
+    # Filter to responses within the contaminated window
+    in_window = merged[
+        (merged[DATE_COL] >= merged["window_start"]) &
+        (merged[DATE_COL] < merged["window_end"])
+    ]
+
+    flagged_indices = in_window["_idx"].unique()
+    flags.iloc[flags.index.isin(flagged_indices)] = "CONTAMINATED_STORE_PERFECT"
+
     return flags
 
 
@@ -603,8 +672,11 @@ def run_fraud_engine(
     print("Layer 2: Store contamination…")
     store_health = compute_store_contamination(df, l1)
     l2 = run_layer2_store_contamination(df, store_health)
-    n_cont = store_health["is_contaminated"].sum()
-    print(f"  → {n_cont} contaminated stores, {(l2 != '').sum():,} responses flagged")
+    n_cont_stores   = store_health[STORE_COL].nunique() if len(store_health) > 0 else 0
+    n_cont_windows  = len(store_health)
+    print(f"  → {n_cont_stores} contaminated stores, "
+          f"{n_cont_windows} contaminated windows, "
+          f"{(l2 != '').sum():,} responses flagged")
 
     print("Layer 3: Velocity anomaly…")
     l3 = run_layer3_velocity_anomaly(df)

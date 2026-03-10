@@ -167,11 +167,7 @@ def _compute_derived_fields(df: pd.DataFrame) -> pd.DataFrame:
     )
 
     # Ensure correct dtypes
-    # Try parsing with format first, fallback to auto-detect
-    try:
-        df[DATE_COL] = pd.to_datetime(df[DATE_COL], format='%Y-%m-%d', errors="coerce")
-    except (ValueError, TypeError):
-        df[DATE_COL] = pd.to_datetime(df[DATE_COL], errors="coerce")
+    df[DATE_COL] = pd.to_datetime(df[DATE_COL], dayfirst=True, errors="coerce")
     df[NPS_COL]  = pd.to_numeric(df[NPS_COL],   errors="coerce")
 
     return df

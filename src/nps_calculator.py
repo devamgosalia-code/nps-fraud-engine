@@ -115,12 +115,21 @@ def compute_store_nps(
     out["nps_inflation"] = (out["reported_nps"] - out["clean_nps"]).round(1)
 
     # Join contamination data
-    if store_health is not None:
-        keep = [c for c in [
-            STORE_COL, "is_contaminated", "dup_ratio",
-            "heavy_dup_count", "perfect_rate", "contamination_reason"
-        ] if c in store_health.columns]
-        out = out.merge(store_health[keep], on=STORE_COL, how="left")
+    if store_health is not None and len(store_health) > 0:
+        # Get set of contaminated stores (stores with at least one contaminated window)
+        contaminated_store_set = set(store_health[STORE_COL].unique())
+        out["is_contaminated"] = out[STORE_COL].isin(contaminated_store_set)
+        
+        # Aggregate window-level metrics to store level (take max/mean as appropriate)
+        store_agg = store_health.groupby(STORE_COL).agg({
+            "dup_ratio": "max",
+            "heavy_dup_count": "max",
+            "perfect_rate": "max",
+            "contamination_reason": lambda x: "|".join(x.unique()) if len(x) > 0 else ""
+        }).reset_index()
+        out = out.merge(store_agg, on=STORE_COL, how="left")
+    else:
+        out["is_contaminated"] = False
 
     # Vectorized risk level
     fp = out["fraud_pct"]

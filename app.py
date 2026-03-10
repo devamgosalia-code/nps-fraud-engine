@@ -271,77 +271,90 @@ def _store_results(scored_df, store_health, name_lb):
     st.session_state.store_nps        = compute_store_nps(scored_df, store_health)
 
 
+# Ensure page has rendered before loading data (helps health check pass)
+st.markdown("")  # Empty markdown to force initial render
+
 if st.session_state.scored_df is None:
     # Use parquet if available (both local and Streamlit Cloud), otherwise BigQuery
     use_parquet = os.path.exists(PARQUET_PATH)
     source = "parquet" if use_parquet else "BigQuery"
     
-    # Show loading state immediately to allow health check to pass
-    st.markdown("### Loading data...")
+    # Create placeholder that renders immediately
+    loading_placeholder = st.empty()
+    with loading_placeholder.container():
+        st.markdown("### 🔍 Loading NPS Fraud Engine...")
+        st.info(f"Loading data from {source}. This may take a minute for large datasets.")
     
-    with st.spinner(f"Loading from {source} & running fraud engine…"):
-        try:
-            if use_parquet:
-                scored_df, store_health, name_lb = _run_pipeline_parquet()
-                print(f"[ENV] Loaded from parquet")
-            else:
-                scored_df, store_health, name_lb = _run_pipeline_bigquery()
-                print(f"[ENV] Loaded from BigQuery")
-            
-            if scored_df is not None and len(scored_df) > 0:
-                _store_results(scored_df, store_health, name_lb)
-                st.rerun()
-            else:
-                st.error("Data loading returned empty dataset. Please check your data source.")
-                st.stop()
-        except (RuntimeError, FileNotFoundError) as e:
-            # If BigQuery fails and parquet exists, try parquet as fallback
-            if not use_parquet and os.path.exists(PARQUET_PATH):
-                error_msg = str(e)
-                if "BigQuery auth failed" in error_msg or "auth" in error_msg.lower():
-                    st.warning(f"BigQuery authentication failed: {e}")
-                    st.info("Falling back to parquet file...")
-                    try:
-                        scored_df, store_health, name_lb = _run_pipeline_parquet()
-                        if scored_df is not None and len(scored_df) > 0:
-                            _store_results(scored_df, store_health, name_lb)
-                            st.rerun()
-                        else:
-                            st.error("Parquet file also returned empty dataset.")
-                            st.stop()
-                    except Exception as e2:
-                        st.error(f"Error loading from parquet fallback: {e2}")
-                        st.exception(e2)
-                        st.stop()
-                else:
-                    st.error(f"Error loading data: {e}")
-                    st.exception(e)
-                    st.stop()
-            # If parquet file fails, try BigQuery as fallback
-            elif use_parquet:
-                st.warning(f"Parquet file not found: {e}")
-                st.info("Falling back to BigQuery...")
+    # Load data (this will take time but page has already responded)
+    try:
+        if use_parquet:
+            scored_df, store_health, name_lb = _run_pipeline_parquet()
+            print(f"[ENV] Loaded from parquet")
+        else:
+            scored_df, store_health, name_lb = _run_pipeline_bigquery()
+            print(f"[ENV] Loaded from BigQuery")
+        
+        if scored_df is not None and len(scored_df) > 0:
+            loading_placeholder.empty()  # Clear loading message
+            _store_results(scored_df, store_health, name_lb)
+            st.rerun()
+        else:
+            loading_placeholder.empty()
+            st.error("Data loading returned empty dataset. Please check your data source.")
+            st.stop()
+    except (RuntimeError, FileNotFoundError) as e:
+        # If BigQuery fails and parquet exists, try parquet as fallback
+        if not use_parquet and os.path.exists(PARQUET_PATH):
+            error_msg = str(e)
+            if "BigQuery auth failed" in error_msg or "auth" in error_msg.lower():
+                loading_placeholder.empty()
+                st.warning(f"BigQuery authentication failed: {e}")
+                st.info("Falling back to parquet file...")
                 try:
-                    scored_df, store_health, name_lb = _run_pipeline_bigquery()
+                    scored_df, store_health, name_lb = _run_pipeline_parquet()
                     if scored_df is not None and len(scored_df) > 0:
                         _store_results(scored_df, store_health, name_lb)
                         st.rerun()
                     else:
-                        st.error("BigQuery also returned empty dataset.")
+                        st.error("Parquet file also returned empty dataset.")
                         st.stop()
                 except Exception as e2:
-                    st.error(f"Error loading from BigQuery fallback: {e2}")
+                    st.error(f"Error loading from parquet fallback: {e2}")
                     st.exception(e2)
                     st.stop()
             else:
+                loading_placeholder.empty()
                 st.error(f"Error loading data: {e}")
                 st.exception(e)
                 st.stop()
-        except Exception as e:
+        # If parquet file fails, try BigQuery as fallback
+        elif use_parquet:
+            loading_placeholder.empty()
+            st.warning(f"Parquet file error: {e}")
+            st.info("Falling back to BigQuery...")
+            try:
+                scored_df, store_health, name_lb = _run_pipeline_bigquery()
+                if scored_df is not None and len(scored_df) > 0:
+                    _store_results(scored_df, store_health, name_lb)
+                    st.rerun()
+                else:
+                    st.error("BigQuery also returned empty dataset.")
+                    st.stop()
+            except Exception as e2:
+                st.error(f"Error loading from BigQuery fallback: {e2}")
+                st.exception(e2)
+                st.stop()
+        else:
+            loading_placeholder.empty()
             st.error(f"Error loading data: {e}")
             st.exception(e)
-            # Prevent app from crashing - allow user to retry
             st.stop()
+    except Exception as e:
+        loading_placeholder.empty()
+        st.error(f"Error loading data: {e}")
+        st.exception(e)
+        # Prevent app from crashing - allow user to retry
+        st.stop()
 
 
 # ─────────────────────────────────────────────────────────────────────────────

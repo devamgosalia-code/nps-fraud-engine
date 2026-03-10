@@ -335,10 +335,10 @@ with tab1:
     col_r, col_c = st.columns(2)
     with col_r:
         st.plotly_chart(_nps_bar(nps["reported_counts"], "Reported NPS (all responses)"),
-                        width="stretch")
+                        use_container_width=True)
     with col_c:
         st.plotly_chart(_nps_bar(nps["clean_counts"], "✅ Clean NPS (fraud excluded)"),
-                        width="stretch")
+                        use_container_width=True)
 
     # ── Layer breakdown ───────────────────────────────────────────────────
     st.markdown("## Fraud by Detection Layer")
@@ -354,7 +354,7 @@ with tab1:
     fig_l.update_layout(**DARK, height=310, xaxis_title="Responses flagged",
                         title=dict(text="Layer breakdown", font=dict(size=13, color="#b0bfd8")))
     fig_l.update_yaxes(autorange="reversed", gridcolor="#181f2e", linecolor="#181f2e")
-    st.plotly_chart(fig_l, width="stretch")
+    st.plotly_chart(fig_l, use_container_width=True)
 
     # ── Layer Legend ──────────────────────────────────────────────────────
     st.markdown("### Detection Layer Legend")
@@ -417,7 +417,7 @@ with tab1:
         ))
         fig_pie.update_layout(**DARK, height=300, showlegend=False,
                               title=dict(text="Disposition", font=dict(size=13, color="#b0bfd8")))
-        st.plotly_chart(fig_pie, width="stretch")
+        st.plotly_chart(fig_pie, use_container_width=True)
 
     with col_trend:
         st.markdown("## Daily NPS Trend")
@@ -438,7 +438,7 @@ with tab1:
                                 legend=dict(font=dict(color="#8896b3")),
                                 title=dict(text="Reported vs Clean NPS",
                                            font=dict(size=13, color="#b0bfd8")))
-            st.plotly_chart(fig_t, width="stretch")
+            st.plotly_chart(fig_t, use_container_width=True)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -563,7 +563,7 @@ with tab2:
     }
     st.dataframe(
         disp[show_cols].head(200).rename(columns=rename),
-        width="stretch",
+        use_container_width=True,
         hide_index=True,
         column_config={
             "Fraud %": st.column_config.ProgressColumn(
@@ -597,7 +597,7 @@ with tab2:
                          title=dict(text="Fraud Map (bubble size = NPS inflation)",
                                     font=dict(size=13, color="#b0bfd8")),
                          legend=dict(font=dict(color="#8896b3")))
-    st.plotly_chart(fig_sc, width="stretch")
+    st.plotly_chart(fig_sc, use_container_width=True)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -643,7 +643,7 @@ with tab3:
         st.markdown("### State Fraud Rankings")
         st.dataframe(
             state_df,
-            width="stretch",
+            use_container_width=True,
             hide_index=True,
             column_config={
                 "Fraud %": st.column_config.ProgressColumn("Fraud %", format="%.1f%%", min_value=0, max_value=100),
@@ -674,7 +674,7 @@ with tab3:
             font=dict(family="Inter", color="#475569", size=11),
             margin=dict(t=44, b=80, l=40, r=16),
         )
-        st.plotly_chart(fig_state, width="stretch")
+        st.plotly_chart(fig_state, use_container_width=True)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -734,7 +734,7 @@ with tab4:
 
             st.dataframe(
                 lb_display[lb_col_order].head(100),
-                width="stretch",
+                use_container_width=True,
                 hide_index=True,
                 column_config={
                     "Mentions": st.column_config.ProgressColumn(
@@ -764,7 +764,7 @@ with tab4:
                            font=dict(size=13, color="#b0bfd8")),
             )
             fig_names.update_yaxes(autorange="reversed", gridcolor="#181f2e", linecolor="#181f2e")
-            st.plotly_chart(fig_names, width="stretch")
+            st.plotly_chart(fig_names, use_container_width=True)
         else:
             st.info("No coaching signals detected (no staff name mentioned 3+ times at same store).")
     else:
@@ -911,7 +911,7 @@ with tab4:
         coaching_view["Date"] = pd.to_datetime(coaching_view["Date"]).dt.date
         st.dataframe(
             coaching_view.sort_values("Store").head(500),
-            width="stretch",
+            use_container_width=True,
             hide_index=True,
             column_config={
                 "Verbatim":    st.column_config.TextColumn("Verbatim",    width="large"),
@@ -981,7 +981,7 @@ with tab5:
             font=dict(family="Inter", color="#475569", size=11),
             margin=dict(t=44, b=36, l=180, r=60),
         )
-        st.plotly_chart(fig_rrid, width="stretch")
+        st.plotly_chart(fig_rrid, use_container_width=True)
 
         st.markdown("### Full RRID Leaderboard")
         rrid_display = rrid_summary.head(100).rename(columns={
@@ -1006,7 +1006,7 @@ with tab5:
 
         st.dataframe(
             rrid_display[rrid_col_order],
-            width="stretch",
+            use_container_width=True,
             hide_index=True,
             column_config={
                 "Submissions": st.column_config.ProgressColumn(
@@ -1094,7 +1094,7 @@ with tab6:
 
     st.dataframe(
         ins[show].head(500),
-        width="stretch",
+        use_container_width=True,
         hide_index=True,
         column_config={
             "fraud_score": st.column_config.ProgressColumn(
@@ -1112,7 +1112,7 @@ with tab6:
             scored_df[RRID_COL].astype(str).str.contains(rrid_search.strip(), case=False)
         ][[RRID_COL, STORE_COL, DATE_COL, NPS_COL, vb_col, "fraud_reasons", "disposition"]]
         if len(rrid_hist):
-            st.dataframe(rrid_hist.sort_values(DATE_COL), width="stretch")
+            st.dataframe(rrid_hist.sort_values(DATE_COL), use_container_width=True)
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1157,7 +1157,7 @@ with tab7:
             "count":        "Flagged Responses",
             "pct_of_total": "% of Total",
         }),
-        width="stretch",
+        use_container_width=True,
         hide_index=True,
     )
 
@@ -1168,7 +1168,7 @@ with tab7:
         "suspected_staff_name", "staff_coaching_flag",
         "fraud_score", "fraud_layer_count", "fraud_reasons", "disposition",
     ] if c in fraud_df.columns]
-    st.dataframe(fraud_df[pr_cols].head(1000), width="stretch", hide_index=True)
+    st.dataframe(fraud_df[pr_cols].head(1000), use_container_width=True, hide_index=True)
 
     st.markdown("---")
     st.markdown("## 📌 Recommendations & Action Plan")
@@ -1282,7 +1282,7 @@ with tab7:
 
     st.dataframe(
         pd.DataFrame(recs),
-        width="stretch",
+        use_container_width=True,
         hide_index=True,
         column_config={
             "Priority": st.column_config.TextColumn("Priority", width="small"),

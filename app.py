@@ -245,9 +245,9 @@ with st.sidebar:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PIPELINE RUNNER  (background thread so the health check passes immediately)
+# PIPELINE RUNNER
 # ─────────────────────────────────────────────────────────────────────────────
-import os, threading
+import os, shutil
 
 PARQUET_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "nps_data.parquet")
 
@@ -271,77 +271,21 @@ def _store_results(scored_df, store_health, name_lb):
     st.session_state.store_nps        = compute_store_nps(scored_df, store_health)
 
 
-# Shared cache for background loading (survives across reruns)
-if "_bg_result" not in st.session_state:
-    st.session_state._bg_result = None   # will hold (scored_df, store_health, name_lb)
-if "_bg_error" not in st.session_state:
-    st.session_state._bg_error = None
-if "_bg_started" not in st.session_state:
-    st.session_state._bg_started = False
-
-
-@st.cache_resource(show_spinner=False)
-def _start_background_load():
-    """Kick off data loading in a daemon thread. Returns a dict used as shared state."""
-    import time
-    state = {"result": None, "error": None, "done": False}
-
-    def _load():
-        try:
-            use_parquet = os.path.exists(PARQUET_PATH)
-            if use_parquet:
-                res = _run_pipeline_parquet()
-                print("[ENV] Loaded from parquet (background)")
-            else:
-                res = _run_pipeline_bigquery()
-                print("[ENV] Loaded from BigQuery (background)")
-            state["result"] = res
-        except Exception as e1:
-            # Fallback: if primary fails, try the other source
-            try:
-                if os.path.exists(PARQUET_PATH) and not use_parquet:
-                    res = _run_pipeline_parquet()
-                    print("[ENV] Fallback: loaded from parquet (background)")
-                elif use_parquet:
-                    res = _run_pipeline_bigquery()
-                    print("[ENV] Fallback: loaded from BigQuery (background)")
-                else:
-                    raise e1
-                state["result"] = res
-            except Exception as e2:
-                state["error"] = str(e2)
-        state["done"] = True
-
-    t = threading.Thread(target=_load, daemon=True)
-    t.start()
-    return state
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# MAIN CONTENT HEADER — renders instantly so health check passes
-# ─────────────────────────────────────────────────────────────────────────────
-st.markdown("# NPS Fraud Detection Engine")
-st.markdown("*Reported NPS · Clean NPS · Store Intelligence · Verbatim Analysis*")
-st.markdown("---")
-
 if st.session_state.scored_df is None:
-    # Start background loading (cached — only runs once)
-    bg = _start_background_load()
-
-    if bg["done"] and bg["result"] is not None:
-        scored_df, store_health, name_lb = bg["result"]
-        _store_results(scored_df, store_health, name_lb)
-        st.rerun()
-    elif bg["done"] and bg["error"] is not None:
-        st.error(f"Failed to load data: {bg['error']}")
-        st.stop()
-    else:
-        # Still loading — show a friendly message and auto-refresh
-        import time
-        source = "parquet" if os.path.exists(PARQUET_PATH) else "BigQuery"
-        st.info(f"Loading data from {source} & running fraud engine… This page will refresh automatically.")
-        time.sleep(3)
-        st.rerun()
+    _has_gcloud = shutil.which("gcloud") is not None
+    use_parquet = os.path.exists(PARQUET_PATH) and not _has_gcloud
+    source = "parquet" if use_parquet else "BigQuery"
+    with st.spinner(f"Loading from {source} & running fraud engine…"):
+        try:
+            if use_parquet:
+                scored_df, store_health, name_lb = _run_pipeline_parquet()
+            else:
+                scored_df, store_health, name_lb = _run_pipeline_bigquery()
+            _store_results(scored_df, store_health, name_lb)
+            st.rerun()
+        except Exception as e:
+            st.error(f"Error loading from {source}: {e}")
+            st.exception(e)
 
 
 # ── Pull from session state ───────────────────────────────────────────────────
